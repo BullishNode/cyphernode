@@ -37,10 +37,6 @@ verify_sign() {
   local payload64=$(echo "${1}" | cut -sd '.' -f2)
   local signature=$(echo "${1}" | cut -sd '.' -f3)
 
-  trace "[verify_sign] header64=${header64}"
-  trace "[verify_sign] payload64=${payload64}"
-  trace "[verify_sign] signature=${signature}"
-
   local padding
   case $((${#payload64}%4)) in
     2) padding='=='
@@ -73,19 +69,24 @@ verify_sign() {
   fi
 
   local exp
-  if [ "${legacy}" -eq "1" ]; then
+  if [ "${legacy}" = "1" ]; then
     exp=$(echo "${legacypayload}" | jq ".exp")
   else
     exp=$(echo "${payload}" | jq ".exp")
   fi
   local current=$(date +"%s")
 
-  trace "[verify_sign] payload=${payload}"
-  trace "[verify_sign] legacypayload=${legacypayload}"
   trace "[verify_sign] exp=${exp}"
   trace "[verify_sign] current=${current}"
 
-  if [ ${exp} -gt ${current} ]; then
+  case "${exp}" in
+    ""|*[!0-9]*)
+      trace "[verify_sign] Invalid expiration"
+      return 1
+      ;;
+  esac
+
+  if [ "${exp}" -gt "${current}" ]; then
     trace "[verify_sign] Not expired, let's validate signature"
     local id=$(echo "${payload}" | jq -r ".id")
     trace "[verify_sign] id=${id}"
@@ -102,26 +103,25 @@ verify_sign() {
 
     local key
     eval key='$ukey_'$id
-    trace "[verify_sign] key=${key}"
+    if [ -z "${key}" ]; then
+      trace "[verify_sign] No key configured for id=${id}"
+      return 1
+    fi
 
     local msg="${header64}.${payload64}"
-    trace "[verify_sign] msg=${msg}"
 
     local comp_sign
-    if [ "${legacy}" -eq "1" ]; then
+    if [ "${legacy}" = "1" ]; then
       comp_sign=$(echo -n "${msg}" | openssl dgst -hmac "${key}" -sha256 -r | cut -sd ' ' -f1)
     else
       comp_sign=$(echo -n "${msg}" | openssl dgst -hmac "${key}" -sha256 -r -binary | basenc --base64url | tr -d '=')
     fi
-    trace "[verify_sign] comp_sign=${comp_sign}"
-
     if [ "${comp_sign}" != "${signature}" ] && [ -z "${legacy}" ]; then
       # Invalid sig and legacy empty, we don't know if legacy or not...
       # So we'll try legacy validation...
       trace "[verify_sign] Invalid signature, let's try legacy..."
 
       comp_sign=$(echo -n "${msg}" | openssl dgst -hmac "${key}" -sha256 -r | cut -sd ' ' -f1)
-      trace "[verify_sign] comp_sign=${comp_sign}"
     fi
 
     if [ "${comp_sign}" = "${signature}" ]; then
@@ -196,7 +196,6 @@ returncode=0
 # $HTTP_AUTHORIZATION = Bearer <token>
 # Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjAwMyIsImV4cCI6MTU0MjE0OTMyNH0=.b811067cf79c7009a0a38f110a6e3bf82cc4310aa6afae75b9d915b9febf13f7
 # If this is not found in header, we leave
-trace "[auth.sh] HTTP_AUTHORIZATION=${HTTP_AUTHORIZATION}"
 # /bin/sh on debian points to dash, which does not support substring in the form ${var:offset:length}
 if [ "-${HTTP_AUTHORIZATION%% *}" = "-Bearer" ]; then
   token="${HTTP_AUTHORIZATION#Bearer }"
@@ -215,4 +214,3 @@ if [ "${returncode}" -eq "1" ]; then
 else
   echo -en "Status: 403 Forbidden\r\n\r\n"
 fi
-

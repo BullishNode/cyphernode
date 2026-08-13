@@ -23,7 +23,7 @@ docker run --rm -d -p 8888:8888 --network cyphernodenet --env-file env.propertie
 ## Configure your container by modifying `env.properties` file
 
 ```properties
-TRACING=1
+TRACING=
 WATCHER_BTC_NODE_RPC_URL=bitcoin:18332/wallet
 WATCHER_BTC_NODE_DEFAULT_WALLET=watching01.dat
 WATCHER_BTC_NODE_XPUB_WALLET=xpubwatching01.dat

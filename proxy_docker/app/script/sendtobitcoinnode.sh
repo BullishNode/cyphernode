@@ -54,6 +54,39 @@ send_to_spender_node() {
   return ${returncode}
 }
 
+# Read balances from one exact, operator-configured wallet name. This is kept
+# separate from send_to_spender_node(), whose optional argument is a legacy
+# numeric selector used by all spender operations.
+send_getbalances_to_spender_wallet_name() {
+  trace "Entering send_getbalances_to_spender_wallet_name()..."
+
+  local walletname=${1:-}
+  local encoded_walletname
+  local returncode
+
+  if [ -z "${walletname}" ]; then
+    trace "[send_getbalances_to_spender_wallet_name] Missing wallet name"
+    return 1
+  fi
+
+  encoded_walletname=$(printf '%s' "${walletname}" | jq -sRr '@uri')
+  returncode=$?
+  trace_rc ${returncode}
+  if [ "${returncode}" -ne 0 ] || [ -z "${encoded_walletname}" ]; then
+    trace "[send_getbalances_to_spender_wallet_name] Could not encode wallet name"
+    return 1
+  fi
+
+  trace "[send_getbalances_to_spender_wallet_name] wallet: ${walletname}"
+  send_to_bitcoin_node \
+    "${SPENDER_BTC_NODE_RPC_URL}/${encoded_walletname}" \
+    "${SPENDER_BTC_NODE_RPC_CFG}" \
+    '{"method":"getbalances"}'
+  returncode=$?
+  trace_rc ${returncode}
+  return ${returncode}
+}
+
 send_to_bitcoin_node() {
   trace "Entering send_to_bitcoin_node()..."
   local returncode
@@ -63,18 +96,18 @@ send_to_bitcoin_node() {
   local config=${2}
   local data=${3}
 
-  trace "[send_to_bitcoin_node] curl -m 20 -s --config ${config} -H \"Content-Type: application/json\" -d \"${data}\" ${node_url}"
-  result=$(curl -m 20 -s --config "${config}" -H "Content-Type: application/json" -d "${data}" "${node_url}")
+  trace "[send_to_bitcoin_node] curl -m 20 --fail --show-error --silent --path-as-is --config ${config} -H \"Content-Type: application/json\" -d \"${data}\" ${node_url}"
+  result=$(curl -m 20 --fail --show-error --silent --path-as-is --config "${config}" -H "Content-Type: application/json" -d "${data}" "${node_url}")
   returncode=$?
   trace_rc ${returncode}
   # trace "[send_to_bitcoin_node] result=${result}"
 
   if [ "${returncode}" -eq 0 ]; then
-    # Node responded, let's see if we got an error message from the node
-    # jq -e will have a return code of 1 if the supplied tag is null.
-    errorstring=$(echo "${result}" | jq -e ".error")
-    if [ "$?" -eq "0" ]; then
-      # Error tag not null, so there's an error
+    if ! printf '%s' "${result}" | jq -e 'type == "object" and has("result") and has("error")' >/dev/null 2>&1; then
+      trace "[send_to_bitcoin_node] Node returned an invalid JSON-RPC response"
+      returncode=1
+    elif ! printf '%s' "${result}" | jq -e '.error == null' >/dev/null 2>&1; then
+      errorstring=$(printf '%s' "${result}" | jq -c '.error')
       trace "[send_to_bitcoin_node] Node responded, error found in response: ${errorstring}"
       returncode=1
     else
