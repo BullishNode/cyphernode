@@ -59,7 +59,6 @@ main() {
 
   while read line; do
     line=$(echo "${line}" | tr -d '\r\n')
-    trace "[main] line=${line}"
 
     if [ "${cmd}" = "" ]; then
       # First line!
@@ -96,7 +95,6 @@ main() {
 #        read -rd '' -n ${content_length} line
         line=$(dd bs=1 count=${content_length} 2>/dev/null)
         line=$(echo "${line}" | jq -c)
-        trace "[main] line=${line}"
       fi
       case "${cmd}" in
         helloworld)

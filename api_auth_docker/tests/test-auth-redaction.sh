@@ -48,4 +48,6 @@ done
 )
 
 [ ! -s "${log_path}" ]
+
+grep -F 'proxy_set_header Authorization "";' "${SOURCE_DIR}/default.conf" >/dev/null
 echo "ok - Gatekeeper tracing does not disclose credentials"
