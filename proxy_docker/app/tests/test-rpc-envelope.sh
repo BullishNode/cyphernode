@@ -1,9 +1,17 @@
 #!/bin/sh
 
-set -u
+set -eu
 
 TRACING=
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/../script" && pwd)
+TEST_FILE_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if [ -d "${TEST_FILE_DIR}/../script" ]; then
+  SCRIPT_DIR=$(CDPATH= cd -- "${TEST_FILE_DIR}/../script" && pwd)
+elif [ -f "${TEST_FILE_DIR}/../sendtobitcoinnode.sh" ]; then
+  SCRIPT_DIR=$(CDPATH= cd -- "${TEST_FILE_DIR}/.." && pwd)
+else
+  echo "could not locate proxy scripts" >&2
+  exit 1
+fi
 TEST_DIR=$(mktemp -d)
 trap 'rm -rf "${TEST_DIR}"' EXIT
 
@@ -76,6 +84,9 @@ send_getbalances_to_spender_wallet_name 'nested/reserve wallet.dat' >/dev/null |
 grep -Fx -- '--fail' "${CURL_ARGS_FILE}" >/dev/null || fail "Bitcoin curl does not fail on HTTP errors"
 grep -Fx -- '--path-as-is' "${CURL_ARGS_FILE}" >/dev/null || fail "Bitcoin curl can normalize literal wallet paths"
 grep -Fx 'http://bitcoin:18443/wallet/nested%2Freserve%20wallet.dat' "${CURL_ARGS_FILE}" >/dev/null || fail "Bitcoin exact wallet name was not encoded"
+
+send_getbalances_to_spender_wallet_name '.' >/dev/null || fail "Bitcoin dot wallet was rejected"
+grep -Fx 'http://bitcoin:18443/wallet/.' "${CURL_ARGS_FILE}" >/dev/null || fail "Bitcoin literal dot wallet path changed"
 
 send_getbalances_to_elements_spender_wallet_name '..' >/dev/null || fail "Elements dot wallet was rejected"
 grep -Fx -- '--fail' "${CURL_ARGS_FILE}" >/dev/null || fail "Elements curl does not fail on HTTP errors"
