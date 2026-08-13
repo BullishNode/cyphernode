@@ -229,10 +229,21 @@ elements_getbalances() {
   trace "[elements_getbalances] response=${response}"
 
   if [ "${returncode}" -eq 0 ]; then
-    local balances=$(echo "${response}" | jq ".result")
-    trace "[elements_getbalances] balances=${balances}"
-
-    data="{\"balances\":${balances}}"
+    local balances
+    balances=$(printf '%s' "${response}" | jq -ce '.result | select(type == "object")')
+    if [ "$?" -ne 0 ]; then
+      trace "[elements_getbalances] Node returned invalid balance data"
+      returncode=1
+      data=""
+    else
+      trace "[elements_getbalances] balances=${balances}"
+      data=$(jq -cn --argjson balances "${balances}" '{balances: $balances}')
+      if [ "$?" -ne 0 ]; then
+        trace "[elements_getbalances] Could not encode balance response"
+        returncode=1
+        data=""
+      fi
+    fi
   else
     trace "[elements_getbalances] Couldn't get balances!"
     data=""

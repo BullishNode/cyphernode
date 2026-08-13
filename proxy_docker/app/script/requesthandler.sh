@@ -54,6 +54,7 @@ main() {
   local line
   local content_length
   local response
+  local normalized_response
   local returncode
 
   while read line; do
@@ -1261,7 +1262,14 @@ main() {
           returncode=1
           ;;
       esac
-      response=$(echo "${response}" | jq -Mc)
+      normalized_response=$(printf '%s' "${response}" | jq -Mc)
+      if [ "$?" -ne 0 ] || [ -z "${normalized_response}" ]; then
+        trace "[main] Refusing to return an invalid JSON response"
+        response='{"error":{"code":-32603,"message":"upstream returned an invalid response"},"id":"1"}'
+        returncode=1
+      else
+        response=${normalized_response}
+      fi
       response_to_client "${response}" ${returncode}
       break
     fi

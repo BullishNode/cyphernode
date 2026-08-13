@@ -99,18 +99,18 @@ send_to_elements_node()
   local config=${2}
   local data=${3}
 
-  trace "[send_to_elements_node] curl -m 60 -s --config ${config} -H \"Content-Type: application/json\" -d \"${data}\" ${node_url}"
-  result=$(curl -m 60 -s --config ${config} -H "Content-Type: application/json" -d "${data}" ${node_url})
+  trace "[send_to_elements_node] curl -m 60 --fail --show-error --silent --path-as-is --config ${config} -H \"Content-Type: application/json\" --data \"${data}\" --url \"${node_url}\""
+  result=$(curl -m 60 --fail --show-error --silent --path-as-is --config "${config}" -H "Content-Type: application/json" --data "${data}" --url "${node_url}")
   returncode=$?
   trace_rc ${returncode}
   # trace "[send_to_elements_node] result=${result}"
 
   if [ "${returncode}" -eq 0 ]; then
-    # Node responded, let's see if we got an error message from the node
-    # jq -e will have a return code of 1 if the supplied tag is null.
-    errorstring=$(echo "${result}" | jq -e ".error")
-    if [ "$?" -eq "0" ]; then
-      # Error tag not null, so there's an error
+    if ! printf '%s' "${result}" | jq -e 'type == "object" and has("result") and has("error")' >/dev/null 2>&1; then
+      trace "[send_to_elements_node] Node returned an invalid JSON-RPC response"
+      returncode=1
+    elif ! printf '%s' "${result}" | jq -e '.error == null' >/dev/null 2>&1; then
+      errorstring=$(printf '%s' "${result}" | jq -c '.error')
       trace "[send_to_elements_node] Node responded, error found in response: ${errorstring}"
       returncode=1
     else
