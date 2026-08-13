@@ -189,24 +189,18 @@ generate_token() {
   key=$(exec_in_test_container sh -c 'source /keys.properties ; echo $ukey_'${id})
   groups=$(exec_in_test_container sh -c 'source /keys.properties ; echo $ugroups_'${id})
   trace 3 "[generate_token] id=${id}\n"
-  trace 3 "[generate_token] key=${key}\n"
   trace 3 "[generate_token] groups=${groups}\n"
 
   local h64broken=$(exec_in_test_container sh -c "echo -n '{\"alg\":\"HS256\",\"typ\":\"JWT\"}' | base64")
-  trace 3 "[generate_token] h64broken=${h64broken}\n"
   local h64=$(exec_in_test_container sh -c "echo -n '{\"alg\":\"HS256\",\"typ\":\"JWT\"}' | basenc --base64url | tr -d '='")
-  trace 3 "[generate_token]       h64=${h64}\n"
   local d=$(exec_in_test_container date +"%s")
   if ! ${expired}; then
     d=$((d+100000))
   fi
   trace 3 "[generate_token] d=${d}\n"
   local p64=$(exec_in_test_container sh -c "echo -n '{\"id\":\"${id}\",\"exp\":${d}}' | basenc --base64url | tr -d '='")
-  trace 3 "[generate_token] p64=${p64}\n"
   local sig=$(exec_in_test_container sh -c "echo -n \"${h64}.${p64}\" | openssl dgst -hmac \"${key}\" -sha256 -r -binary | basenc --base64url | tr -d '='")
-  trace 3 "[generate_token] sig=${sig}\n"
   local token="${h64}.${p64}.${sig}"
-  trace 3 "[generate_token] token=${token}\n\n"
 
   trace 1 "[test_gatekeeper] ${BCyan}Current user ${id} with groups ${groups}${Color_Off}\n"
 
@@ -221,19 +215,14 @@ generate_broken_token() {
   key=$(exec_in_test_container sh -c 'source /keys.properties ; echo $ukey_'${id})
   groups=$(exec_in_test_container sh -c 'source /keys.properties ; echo $ugroups_'${id})
   trace 3 "[generate_token] id=${id}\n"
-  trace 3 "[generate_token] key=${key}\n"
   trace 3 "[generate_token] groups=${groups}\n"
 
   local h64broken=$(exec_in_test_container sh -c "echo -n '{\"alg\":\"HS256\",\"typ\":\"JWT\"}' | base64")
-  trace 3 "[generate_token] h64broken=${h64broken}\n"
   local d=$(exec_in_test_container date +"%s")
   trace 3 "[generate_token] d=${d}\n"
   local p64broken=$(exec_in_test_container sh -c "echo -n '{\"id\":\"${id}\",\"exp\":$((d+100000))}' | base64")
-  trace 3 "[generate_token] p64broken=${p64broken}\n"
   local sigbroken=$(exec_in_test_container sh -c "echo -n \"${h64}.${p64}\" | openssl dgst -hmac \"${key}\" -sha256 -r | cut -sd ' ' -f1")
-  trace 3 "[generate_token] sigbroken=${sigbroken}\n"
   local token="${h64broken}.${p64broken}.${sigbroken}"
-  trace 3 "[generate_token] token=${token}\n\n"
 
   trace 1 "[test_gatekeeper] ${BCyan}Current user ${id} with groups ${groups}${Color_Off}\n"
 
