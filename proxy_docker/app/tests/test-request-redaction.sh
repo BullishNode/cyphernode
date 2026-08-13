@@ -35,13 +35,23 @@ run_request() {
 }
 
 run_request 1
-grep -F 'Entering main()' "${log_path}" >/dev/null
+grep -F 'proxy event' "${log_path}" >/dev/null
 for secret in "${authorization_sentinel}" "${body_sentinel}"; do
   if grep -F "${secret}" "${log_path}" >/dev/null; then
     echo "request material was written to the proxy trace" >&2
     exit 1
   fi
 done
+
+(
+  cd "${TEST_DIR}"
+  TRACING=1 PROXY_LOG_PATH="${log_path}" sh -c \
+    '. ./trace.sh; trace "[send_to_bitcoin_node] request=raw-transaction-sentinel"'
+)
+if grep -F 'raw-transaction-sentinel' "${log_path}" >/dev/null; then
+  echo "method-level request material was written to the proxy trace" >&2
+  exit 1
+fi
 
 : > "${log_path}"
 run_request 0

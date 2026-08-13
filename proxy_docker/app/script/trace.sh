@@ -9,7 +9,12 @@ trace_enabled() {
 
 trace() {
   if trace_enabled; then
-    local str="$(date -u '+%Y-%m-%dT%H:%M:%S.%3N') $$ ${1}"
+    local event
+    event=$(printf '%s' "${1}" | sed -n 's/^\(\[[A-Za-z0-9_. -]*\]\).*/\1/p')
+    if [ -z "${event}" ]; then
+      event="proxy event"
+    fi
+    local str="$(date -u '+%Y-%m-%dT%H:%M:%S.%3N') $$ ${event}"
     echo "${str}" 1>&2
     echo "${str}" >> "${PROXY_LOG_PATH:-/cnlogs/proxy.log}"
   fi
