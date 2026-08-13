@@ -718,11 +718,14 @@ getbalance() {
 getbalances() {
   trace "Entering getbalances()..."
 
-  local wallet=${1:-}
+  local wallet_selector=${1:-}
+  local wallet_name=${2:-}
   local response
   local data='{"method":"getbalances"}'
-  if [ -n "${wallet}" ]; then
-    response=$(send_to_spender_node "${data}" "${wallet}")
+  if [ -n "${wallet_name}" ]; then
+    response=$(send_getbalances_to_spender_wallet_name "${wallet_name}")
+  elif [ -n "${wallet_selector}" ]; then
+    response=$(send_to_spender_node "${data}" "${wallet_selector}")
   else
     response=$(send_to_spender_node "${data}")
   fi

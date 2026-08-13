@@ -600,6 +600,9 @@ test_elements_spender_functions() {
   # action_elements_get_txns_spending=spender
   test_authorization "elements_get_txns_spending" "${token}" ${has_access} || return 10
 
+  # action_elements_getbalances=spender
+  test_authorization "elements_getbalances" "${token}" ${has_access} || return 15
+
   # action_elements_getnewaddress=spender
   test_authorization "elements_getnewaddress" "${token}" ${has_access} || return 35
 

@@ -213,9 +213,17 @@ elements_getbalance() {
 elements_getbalances() {
   trace "Entering elements_getbalances()..."
 
+  local wallet_selector=${1:-}
+  local wallet_name=${2:-}
   local response
   local data='{"method":"getbalances"}'
-  response=$(send_to_elements_spender_node "${data}")
+  if [ -n "${wallet_name}" ]; then
+    response=$(send_getbalances_to_elements_spender_wallet_name "${wallet_name}")
+  elif [ -n "${wallet_selector}" ]; then
+    response=$(send_to_elements_spender_node "${data}" "${wallet_selector}")
+  else
+    response=$(send_to_elements_spender_node "${data}")
+  fi
   local returncode=$?
   trace_rc ${returncode}
   trace "[elements_getbalances] response=${response}"
