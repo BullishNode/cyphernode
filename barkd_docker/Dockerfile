@@ -5,8 +5,8 @@
 
 FROM rust:1-bookworm AS builder
 
-ARG SCUTTLE_REPO=https://github.com/BullishNode/scuttle.git
-ARG SCUTTLE_COMMIT=44032626581caac1a32ff18c537108747476cb2b
+ARG SCUTTLE_REPO=https://github.com/SatoshiPortal/scuttle.git
+ARG SCUTTLE_COMMIT=31fe17cd41c6b0f821c2660d080080a7636a261e
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git clang pkg-config libssl-dev protobuf-compiler \

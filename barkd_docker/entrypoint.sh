@@ -114,14 +114,20 @@ fingerprint=$(api GET /wallet | jq -r '.fingerprint // empty')
 if [ -z "${fingerprint}" ]; then
   wait_for_sync
   log "no wallet found, creating one on ${ARK_NETWORK:-mainnet} against ${ARK_SERVER_URL}"
-  request=$(jq -cn \
-    --arg ark "${ARK_SERVER_URL}" \
-    --arg network "${ARK_NETWORK:-mainnet}" \
-    --arg bitcoind "${BITCOIND_RPC_URL}" \
-    --arg user "${BITCOIND_RPC_USER}" \
-    --arg pass "${BITCOIND_RPC_PASS}" \
-    '{ark_server: $ark, network: $network,
-      chain_source: {bitcoind: {bitcoind: $bitcoind, bitcoind_auth: {"user-pass": {user: $user, pass: $pass}}}}}')
+  if [ -s "${DATADIR}/config.toml" ]; then
+    # A rendered config already supplies the Ark server and chain source.
+    # Bark rejects a create request that supplies both that file and flags.
+    request=$(jq -cn --arg network "${ARK_NETWORK:-mainnet}" '{network: $network}')
+  else
+    request=$(jq -cn \
+      --arg ark "${ARK_SERVER_URL}" \
+      --arg network "${ARK_NETWORK:-mainnet}" \
+      --arg bitcoind "${BITCOIND_RPC_URL}" \
+      --arg user "${BITCOIND_RPC_USER}" \
+      --arg pass "${BITCOIND_RPC_PASS}" \
+      '{ark_server: $ark, network: $network,
+        chain_source: {bitcoind: {bitcoind: $bitcoind, bitcoind_auth: {"user-pass": {user: $user, pass: $pass}}}}}')
+  fi
   if ! api POST /wallet/create "${request}" > /dev/null; then
     log "wallet creation failed"
     kill -TERM ${BARKD_PID} 2>/dev/null
