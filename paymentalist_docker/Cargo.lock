@@ -94,7 +94,7 @@ checksum = "dcfed56ad506cb2c684a14971b8861fdc3baaaae314b9e5f9bb532cbe3ba7a4f"
 [[package]]
 name = "ark-lib"
 version = "0.8.1"
-source = "git+https://github.com/SatoshiPortal/scuttle?rev=31fe17cd41c6b0f821c2660d080080a7636a261e#31fe17cd41c6b0f821c2660d080080a7636a261e"
+source = "git+https://github.com/SatoshiPortal/scuttle?rev=109f090ca69da13f5df3ffb8ff3ab345bc3f097b#109f090ca69da13f5df3ffb8ff3ab345bc3f097b"
 dependencies = [
  "async-trait",
  "bark-bitcoin-ext",
@@ -223,7 +223,7 @@ dependencies = [
 [[package]]
 name = "bark-bitcoin-ext"
 version = "0.8.1"
-source = "git+https://github.com/SatoshiPortal/scuttle?rev=31fe17cd41c6b0f821c2660d080080a7636a261e#31fe17cd41c6b0f821c2660d080080a7636a261e"
+source = "git+https://github.com/SatoshiPortal/scuttle?rev=109f090ca69da13f5df3ffb8ff3ab345bc3f097b#109f090ca69da13f5df3ffb8ff3ab345bc3f097b"
 dependencies = [
  "bitcoin 0.32.7",
  "lazy_static",

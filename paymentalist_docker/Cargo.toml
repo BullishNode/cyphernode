@@ -20,7 +20,7 @@ bitcoin_hashes = "0.13.0"
 boltz-client = { git = "https://github.com/SatoshiPortal/boltz-rust", rev = "3a6d3f4b21ca2510fac7b9c59a2401ab2ea9c744" }
 
 # Ark address route hints in bolt11 invoices
-ark-lib = { git = "https://github.com/SatoshiPortal/scuttle", rev = "31fe17cd41c6b0f821c2660d080080a7636a261e" }
+ark-lib = { git = "https://github.com/SatoshiPortal/scuttle", rev = "109f090ca69da13f5df3ffb8ff3ab345bc3f097b" }
 
 # Command line argument parsing
 clap = { version = "4.4", features = ["derive"] }
