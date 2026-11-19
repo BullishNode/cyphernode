@@ -16,6 +16,30 @@ sql_json() {
   sql "SELECT row_to_json(t) FROM (${1}) t"
 }
 
+# A locked wallet database is a transient read failure under concurrent
+# barkd requests. Reads have no payment side effect and can be retried.
+ark_barkd_read() {
+  local path=${1} response returncode message attempt=0
+  while :; do
+    response=$(barkd_call GET "${path}")
+    returncode=$?
+    [ "${returncode}" -eq 0 ] && { printf '%s' "${response}"; return 0; }
+    message=$(printf '%s' "${response}" | jq -r '.message // .error // empty' 2>/dev/null)
+    if [ "${returncode}" -ne 2 ] || [ "${attempt}" -ge 3 ] ||
+       ! printf '%s' "${message}" | grep -qi 'database is locked'; then
+      printf '%s' "${response}"
+      return "${returncode}"
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.2
+  done
+}
+
+ark_database_locked() {
+  printf '%s' "${1}" | jq -r '.message // .error // empty' 2>/dev/null |
+    grep -qi 'database is locked'
+}
+
 ark_is_address() {
   printf '%s' "${1}" | grep -Eq '^(ark|tark)1[ac-hj-np-z02-9]{20,}$'
 }
@@ -25,17 +49,17 @@ ark_getinfo() {
 
   local connected info next_round balance vtxos history returncode
 
-  connected=$(barkd_call GET /wallet/connected)
+  connected=$(ark_barkd_read /wallet/connected)
   returncode=$?
   if [ "${returncode}" -ne 0 ]; then
     barkd_error "${returncode}" "${connected}"
     return 1
   fi
-  info=$(barkd_call GET /wallet/ark-info) || info='null'
-  next_round=$(barkd_call GET /wallet/next-round) || next_round='null'
-  balance=$(barkd_call GET /wallet/balance) || balance='null'
-  vtxos=$(barkd_call GET /wallet/vtxos) || vtxos='[]'
-  history=$(barkd_call GET /history) || history='[]'
+  info=$(ark_barkd_read /wallet/ark-info) || info='null'
+  next_round=$(ark_barkd_read /wallet/next-round) || next_round='null'
+  balance=$(ark_barkd_read /wallet/balance) || balance='null'
+  vtxos=$(ark_barkd_read /wallet/vtxos) || vtxos='[]'
+  history=$(ark_barkd_read /history) || history='[]'
 
   # Health: money that is not spendable shows in balance, coins that need
   # merging in vtxos, and a wallet whose refresh keeps failing in
@@ -57,7 +81,7 @@ ark_barkd_get() {
   trace "Entering ark_barkd_get(${1})..."
 
   local response returncode
-  response=$(barkd_call GET "${1}")
+  response=$(ark_barkd_read "${1}")
   returncode=$?
   if [ "${returncode}" -ne 0 ]; then
     barkd_error "${returncode}" "${response}"
@@ -69,9 +93,18 @@ ark_barkd_get() {
 ark_barkd_post() {
   trace "Entering ark_barkd_post(${1})..."
 
-  local response returncode
-  response=$(barkd_call POST "${1}" "${2}")
-  returncode=$?
+  local response returncode attempt=0
+  while :; do
+    response=$(barkd_call POST "${1}" "${2}")
+    returncode=$?
+    if [ "${3:-}" != retry_address ] || [ "${returncode}" -ne 2 ] ||
+       [ "${attempt}" -ge 3 ] || ! ark_database_locked "${response}"; then
+      break
+    fi
+    # The first address may have been allocated, but no money was sent.
+    attempt=$((attempt + 1))
+    sleep 0.2
+  done
   if [ "${returncode}" -ne 0 ]; then
     barkd_error "${returncode}" "${response}"
     return 1
@@ -114,11 +147,11 @@ ark_getmovement() {
 }
 
 ark_getnewaddress() {
-  ark_barkd_post /wallet/addresses/next
+  ark_barkd_post /wallet/addresses/next '' retry_address
 }
 
 ark_onchain_getnewaddress() {
-  ark_barkd_post /onchain/addresses/next
+  ark_barkd_post /onchain/addresses/next '' retry_address
 }
 
 ark_onchain_getbalance() {
@@ -136,7 +169,7 @@ ark_send() {
 
   local request=${1}
   local destination amount event_message
-  local connected floor response returncode message movement_id
+  local connected floor history response returncode message movement_id
 
   destination=$(printf '%s' "${request}" | jq -r '.destination // empty')
   amount=$(printf '%s' "${request}" | jq -r '.amount // empty')
@@ -154,7 +187,7 @@ ark_send() {
   fi
 
   # barkd reports a lost server connection as an invalid address.
-  connected=$(barkd_call GET /wallet/connected)
+  connected=$(ark_barkd_read /wallet/connected)
   returncode=$?
   if [ "${returncode}" -ne 0 ]; then
     barkd_error "${returncode}" "${connected}"
@@ -165,7 +198,14 @@ ark_send() {
     return 1
   fi
 
-  floor=$(barkd_call GET "/history?type=ark&value=${destination}" | jq 'if type == "array" then [.[].id] | max // 0 else empty end')
+  history=$(ark_barkd_read "/history?type=ark&value=${destination}") || {
+    echo '{"error":{"code":-32001,"message":"Ark payment history unavailable; nothing was sent"}}'
+    return 1
+  }
+  floor=$(printf '%s' "${history}" | jq -er 'if type == "array" then [.[].id] | max // 0 else empty end') || {
+    echo '{"error":{"code":-32001,"message":"Ark payment history invalid; nothing was sent"}}'
+    return 1
+  }
   response=$(barkd_call POST /wallet/send "$(jq -cn --arg d "${destination}" --argjson a "${amount}" '{destination: $d, amount_sat: $a}')")
   returncode=$?
   trace "[ark_send] response=${response}"
@@ -175,6 +215,12 @@ ark_send() {
     return 1
   fi
   if [ "${returncode}" -ne 0 ]; then
+    if ark_database_locked "${response}"; then
+      # The action may exist before it appears in history. An empty history
+      # result cannot prove that a second send is safe.
+      echo '{"error":{"code":-32001,"message":"Ark payment outcome unknown after a wallet lock; check ark_listmovements"}}'
+      return 1
+    fi
     message=$(printf '%s' "${response}" | jq -r '.message // empty' 2>/dev/null)
     case "${message}" in
       "Insufficient money available"*)
@@ -205,7 +251,7 @@ ark_send() {
 # The one successful movement after the floor that paid amount to the
 # destination; nothing when there is none or more than one.
 ark_find_send_movement() {
-  barkd_call GET "/history?type=ark&value=${1}" | jq -r --arg d "${1}" --argjson a "${2}" --argjson f "${3}" '
+  ark_barkd_read "/history?type=ark&value=${1}" | jq -r --arg d "${1}" --argjson a "${2}" --argjson f "${3}" '
     [ .[] | select(.status == "successful" and .id > $f)
       | select(any(.sent_to[]; .destination.type == "ark" and .destination.value == $d and .amount_sat == $a)) ]
     | if length == 1 then .[0].id else empty end'
@@ -393,11 +439,13 @@ ark_ln_find_send_movement() {
   local path=/history
   local history
   [ -n "${2:-}" ] && path="/history?type=invoice&value=${2}"
-  history=$(barkd_call GET "${path}") || return 1
+  history=$(ark_barkd_read "${path}") || return 1
   printf '%s' "${history}" | jq -c --arg h "${1}" --arg i "${2:-}" '
     if type == "array" then
       [ .[] | select(
-          (.subsystem.name == "bark.lightning_send" and ($h == "" or .metadata.payment_hash == $h))
+          (.subsystem.name == "bark.lightning_send" and
+            (if $h != "" then .metadata.payment_hash == $h
+             else $i != "" and any(.sent_to[]?; .destination.value == $i) end))
           or ($i != "" and .subsystem.name == "bark.arkoor" and .subsystem.kind == "send"
               and any(.sent_to[]?; .destination.value == $i))) ]
       | max_by(.id) // empty
@@ -445,8 +493,23 @@ ark_ln_send_finish() {
 # description check and the payment hash; without it, the description is
 # not checked and the payment hash comes from barkd's reply.
 # The public key of the Ark server the wallet is on; empty when unknown.
+# Cache across script processes, with an explicit refresh after a failed hint
+# check. The cache contains only a public key.
 ark_server_pubkey() {
-  BARKD_TIMEOUT=5 barkd_call GET /wallet/ark-info | jq -r '.server_pubkey // empty' 2>/dev/null
+  local cache=${ARK_SERVER_PUBKEY_CACHE:-${DB_PATH:-/tmp}/ark_server_pubkey}
+  local info key tmp
+  if [ "${1:-}" != refresh ] && [ -s "${cache}" ]; then
+    cat "${cache}"
+    return 0
+  fi
+  info=$(BARKD_TIMEOUT=20 ark_barkd_read /wallet/ark-info) || return 1
+  key=$(printf '%s' "${info}" | jq -r '.server_pubkey // empty' 2>/dev/null)
+  [ -n "${key}" ] || return 1
+  umask 077
+  tmp=$(mktemp "${cache}.XXXXXX") || return 1
+  printf '%s' "${key}" > "${tmp}"
+  mv "${tmp}" "${cache}"
+  printf '%s' "${key}"
 }
 
 # CLN decode exposes invoice route hints as one-hop routes. Ark encodes its
@@ -472,10 +535,19 @@ ark_bolt11_has_hint() {
 # payment. Missing server information or a paymentalist failure is an error.
 ark_bolt11_address() {
   local bolt11=${1}
-  local server result
+  local server result address
 
-  server=$(ark_server_pubkey)
+  server=$(ark_server_pubkey) || return 1
   [ -n "${server}" ] || return 1
+  result=$(check_bolt11_mrh "${bolt11}" "" "${server}")
+  address=$(printf '%s' "${result}" | jq -er '.result.ark_address | select(type == "string" and length > 0)' 2>/dev/null)
+  if [ -n "${address}" ]; then
+    printf '%s' "${address}"
+    return 0
+  fi
+  # A changed server key invalidates the old route hint. Refresh only when
+  # validation fails, then verify again against the new key.
+  server=$(ark_server_pubkey refresh) || return 1
   result=$(check_bolt11_mrh "${bolt11}" "" "${server}") || return 1
   printf '%s' "${result}" | jq -er '.result.ark_address | select(type == "string" and length > 0)' 2>/dev/null
 }
@@ -580,7 +652,7 @@ ark_lnpay() (
   fi
 
   # barkd reports a lost server connection as an invalid destination.
-  connected=$(barkd_call GET /wallet/connected)
+  connected=$(ark_barkd_read /wallet/connected)
   returncode=$?
   if [ "${returncode}" -ne 0 ]; then
     barkd_error "${returncode}" "${connected}"
@@ -611,6 +683,13 @@ ark_lnpay() (
     return 1
   fi
   if [ "${returncode}" -ne 0 ]; then
+    if ark_database_locked "${response}"; then
+      # A hinted invoice may be an Ark send with a fresh action id. Its
+      # movement can appear after this response, so leave the saved row
+      # pending and do not submit the invoice a second time.
+      echo '{"error":{"code":-32001,"message":"Lightning payment outcome unknown after a wallet lock; check ark_listmovements"}}'
+      return 1
+    fi
     message=$(printf '%s' "${response}" | jq -r '.message // empty' 2>/dev/null)
     case "${message}" in
       "Insufficient money available"*)
@@ -644,7 +723,7 @@ ark_lnpay() (
   deadline=$(( $(date +%s) + ${ARK_LNPAY_WAIT:-85} ))
   status=pending
   while :; do
-    send=$(barkd_call GET "/lightning/sends/${payment_hash}")
+    send=$(ark_barkd_read "/lightning/sends/${payment_hash}")
     if [ "$?" -eq 0 ] && [ "$(printf '%s' "${send}" | jq -r '.state')" = "paid" ]; then
       status=complete
       break
@@ -752,7 +831,7 @@ ark_lncreateinvoice() {
     expires_at=$(printf '%s' "${decoded}" | jq -r 'if .created_at and .expiry then .created_at + .expiry else empty end')
   fi
   if [ -z "${payment_hash}" ]; then
-    info=$(barkd_call GET "/lightning/receives/${bolt11}")
+    info=$(ark_barkd_read "/lightning/receives/${bolt11}")
     payment_hash=$(printf '%s' "${info}" | jq -r '.payment_hash // empty')
   fi
   [ -z "${expires_at}" ] && [ -n "${expiry}" ] && expires_at=$(( $(date +%s) + expiry ))
@@ -783,7 +862,7 @@ ark_lngetinvoice() {
   bolt11=$(printf '%s' "${row}" | jq -r '.bolt11 // empty')
   state=null
   if [ -n "${bolt11}" ]; then
-    info=$(barkd_call GET "/lightning/receives/${bolt11}") && state=$(printf '%s' "${info}" | jq -c '.state')
+    info=$(ark_barkd_read "/lightning/receives/${bolt11}") && state=$(printf '%s' "${info}" | jq -c '.state')
   fi
 
   printf '%s' "${row}" | jq -c --argjson state "${state:-null}" '
