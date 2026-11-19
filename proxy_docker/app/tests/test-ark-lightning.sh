@@ -23,6 +23,7 @@ TRACING=
 BARKD_URL=stub
 BARKD_CURL_CFG=/dev/null
 BARKD_TOKEN_FILE=/dev/null
+ARK_SERVER_PUBKEY_CACHE="${STATE}/server_pubkey"
 TOR_ADDR_WATCH_WEBHOOKS=
 TOR_TXID_WATCH_WEBHOOKS=
 FEATURE_LIGHTNING=false
@@ -78,6 +79,12 @@ barkd_call() {
     /history*) [ -n "${HISTORY_SLEEP:-}" ] && ! grep -q '^POST /lightning/pay' "${BARKD_LOG}" && sleep "${HISTORY_SLEEP}" ;;
   esac
   printf '%s %s %s\n' "${1}" "${2}" "${3:-}" >> "${BARKD_LOG}"
+  if [ -n "${LOCK_PAY_ONCE:-}" ] && [ "${2}" = /lightning/pay ] && [ ! -e "${STATE}/pay-lock" ]; then
+    touch "${STATE}/pay-lock"
+    printf 409 > "$(barkd_http_code_file)"
+    echo '{"message":"database is locked"}'
+    return 2
+  fi
   case "${BARKD_MODE}" in
     ok)
       case "${2}" in
@@ -95,7 +102,8 @@ barkd_call() {
         /history*)
           if [ -n "${PREPAID}" ]; then
             echo "[$(send_movement successful)]"
-          elif grep -q '^POST /lightning/pay' "${BARKD_LOG}"; then
+          elif grep -q '^POST /lightning/pay' "${BARKD_LOG}" &&
+               { [ "${LOCK_PAY_ONCE:-}" != uncommitted ] || [ "$(grep -c '^POST /lightning/pay' "${BARKD_LOG}")" -ge 2 ]; }; then
             echo "[$(send_movement "${MOVEMENT_STATUS}")]"
           else
             echo '[]'
@@ -178,8 +186,8 @@ check "offers, lightning addresses and lnurls are not invoices" \
 check "Ark marker detection accepts only one-hop Ark SCIDs" \
   "ark_bolt11_has_hint '{\"routes\":[[{\"short_channel_id\":\"6386283x65536x0\"}]]}' && ark_bolt11_has_hint '{\"routes\":[[{\"short_channel_id\":\"6386283x131072x0\"}]]}' && ! ark_bolt11_has_hint '{\"routes\":[[{\"short_channel_id\":\"6386283x196608x0\"}]]}' && ! ark_bolt11_has_hint '{\"routes\":[[{\"short_channel_id\":\"6386283x65536x0\"},{\"short_channel_id\":\"1x1x1\"}]]}'"
 
-( barkd_call() { [ "${BARKD_TIMEOUT:-}" = 5 ] && echo '{"server_pubkey":"02aa"}'; }
-  check "Ark server lookup has a five-second timeout" "[ \"\$(ark_server_pubkey)\" = 02aa ]"
+( barkd_call() { [ "${BARKD_TIMEOUT:-}" = 20 ] && echo '{"server_pubkey":"02aa"}'; }
+  check "Ark server lookup allows a busy wallet twenty seconds" "[ \"\$(ark_server_pubkey)\" = 02aa ]"
 ) || fail=1
 
 ( . ./paymentalist.sh
@@ -285,6 +293,19 @@ out=$(ark_lnpay '{"destination":"'${INV}'"}')
 check "insufficient funds is refused with barkd's message and published" \
   "jqcheck '${out}' '.error.code == 409 and (.error.message | startswith(\"Insufficient money available\"))' && grep -q '^insufficientfunds {\"method\":\"ark_lnpay\",\"error\":\"Insufficient money available' '${MQTT_LOG}'"
 BARKD_MODE=ok
+
+reset
+LOCK_PAY_ONCE=uncommitted
+out=$(ark_lnpay '{"destination":"'${INV}'"}')
+check "a locked Lightning pay without a movement stays pending and is not resubmitted" \
+  "jqcheck '${out}' '.error.code == -32001 and (.error.message | contains(\"outcome unknown\"))' && [ \"\$(grep -c '^POST /lightning/pay' '${BARKD_LOG}')\" -eq 1 ] && ! grep -q \"UPDATE ark_ln_send SET status='failed'\" '${SQL_LOG}'"
+
+reset
+LOCK_PAY_ONCE=recorded
+out=$(ark_lnpay '{"destination":"'${INV}'"}')
+check "a movement after a locked Lightning pay prevents a second payment" \
+  "jqcheck '${out}' '.error.code == -32001' && [ \"\$(grep -c '^POST /lightning/pay' '${BARKD_LOG}')\" -eq 1 ]"
+LOCK_PAY_ONCE=
 
 # With Cyphernode's CLN: description check and payment hash before the call.
 reset
@@ -477,11 +498,16 @@ ARK_SERVER=02aa
   MRH_MODE=ark
   check "an Ark address of our Ark server is reported" "[ \"\$(ark_bolt11_address ${INV})\" = tark1hinted ]"
   check "the check is asked about our Ark server only" "grep -q '^${INV}||02aa\$' '${MRH_LOG}'"
+  calls=$(grep -c '^GET /wallet/ark-info' "${BARKD_LOG}")
+  check "Ark server key is reused across payments" "[ \"\$(ark_bolt11_address ${INV})\" = tark1hinted ] && [ \"\$(grep -c '^GET /wallet/ark-info' '${BARKD_LOG}')\" -eq ${calls} ]"
+  ARK_SERVER=03bb
   MRH_MODE=none
   check "an invoice without an Ark address has none" "[ -z \"\$(ark_bolt11_address ${INV})\" ]"
+  check "a failed hint check refreshes the server key" "[ \"\$(cat '${ARK_SERVER_PUBKEY_CACHE}')\" = 03bb ]"
   MRH_MODE=down
   check "an unreachable check reports no Ark address" "[ -z \"\$(ark_bolt11_address ${INV})\" ]"
   ARK_SERVER=
+  rm "${ARK_SERVER_PUBKEY_CACHE}"
   MRH_MODE=ark
   check "no Ark address without a known Ark server" "[ -z \"\$(ark_bolt11_address ${INV})\" ]"
   exit ${fail}
