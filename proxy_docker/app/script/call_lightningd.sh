@@ -320,6 +320,22 @@ ln_pay() {
   local request=${1}
   local bolt11=$(echo "${request}" | jq -r ".bolt11")
   trace "[ln_pay] bolt11=${bolt11}"
+
+  # Decode first. An ordinary invoice never needs barkd or paymentalist.
+  # A marked Ark route hint cannot fall back to a CLN payment when its
+  # address or server cannot be verified.
+  result=$(ln_call_lightningd decode "${bolt11}")
+  returncode=$?
+  if [ "${FEATURE_ARK}" = "true" ] && [ "${returncode}" -eq 0 ] && ark_bolt11_has_hint "${result}"; then
+    if [ -z "$(ark_bolt11_address "${bolt11}")" ]; then
+      echo '{"error":{"code":-32003,"message":"Ark address route hint could not be verified; nothing was sent"}}'
+      return 1
+    fi
+    trace "[ln_pay] invoice has a verified Ark address route hint, paying from the Ark wallet"
+    ark_lnpay "${request}"
+    return $?
+  fi
+
   local expected_msatoshi=$(echo "${request}" | jq ".expected_msatoshi")
   trace "[ln_pay] expected_msatoshi=${expected_msatoshi}"
   if [ "${expected_msatoshi}" = "null" ]; then
@@ -334,9 +350,6 @@ ln_pay() {
   fi
 
   # Let's first decode the bolt11 string to make sure we are paying the good invoice
-  result=$(ln_call_lightningd decode "${bolt11}")
-  returncode=$?
-
   if [ "${returncode}" -eq "0" ]; then
     local invoice_msatoshi=$(echo "${result}" | jq ".amount_msat")
     trace "[ln_pay] invoice_msatoshi=${invoice_msatoshi}"

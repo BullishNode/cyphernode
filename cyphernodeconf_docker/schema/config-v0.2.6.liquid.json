@@ -52,6 +52,16 @@
     },
     {
       "if": {
+        "required": ["net", "features"],
+        "properties": {
+          "net": {"const": "testnet"},
+          "features": {"contains": {"const": "ark"}}
+        }
+      },
+      "then": false
+    },
+    {
+      "if": {
         "properties": {
           "run_as_different_user": {
             "enum": [
@@ -195,6 +205,34 @@
           "otsclient_datapath"
         ]
       }
+    },
+    {
+      "if": {
+        "properties": {
+          "features": {
+            "contains": {
+              "enum": [
+                "ark"
+              ]
+            }
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "ark_server_url",
+          "ark_datapath"
+        ],
+        "properties": {
+          "net": {
+            "enum": [
+              "mainnet",
+              "signet",
+              "regtest"
+            ]
+          }
+        }
+      }
     }
   ],
   "properties": {
@@ -237,7 +275,8 @@
           "elements",
           "otsclient",
           "batcher",
-          "specter"
+          "specter",
+          "ark"
         ],
         "title": "The feature",
         "default": "",
@@ -247,7 +286,8 @@
           "elements",
           "otsclient",
           "batcher",
-          "specter"
+          "specter",
+          "ark"
         ]
       }
     },
@@ -823,6 +863,30 @@
         "ff0000",
         "00ff00",
         "00ffff"
+      ]
+    },
+    "ark_server_url": {
+      "$id": "#/properties/ark_server_url",
+      "type": "string",
+      "title": "Ark server (captaind) URL",
+      "examples": [
+        "https://ark.example.com"
+      ]
+    },
+    "ark_datapath": {
+      "$id": "#/properties/ark_datapath",
+      "type": "string",
+      "title": "Ark wallet (barkd) datapath",
+      "examples": [
+        "/tmp/cyphernode/ark"
+      ]
+    },
+    "ark_datapath_custom": {
+      "$id": "#/properties/ark_datapath_custom",
+      "type": "string",
+      "title": "Ark wallet custom datapath",
+      "examples": [
+        "/tmp/cyphernode/ark"
       ]
     }
   }

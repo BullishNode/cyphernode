@@ -95,6 +95,7 @@ module.exports = class App {
       elements_version: process.env.ELEMENTS_VERSION,
       lightning_version: process.env.LIGHTNING_VERSION,
       paymentalist_version: process.env.PAYMENTALIST_VERSION,
+      barkd_version: process.env.BARKD_VERSION,
       notifier_version: process.env.NOTIFIER_VERSION,
       conf_version: process.env.CONF_VERSION,
       setup_version: process.env.SETUP_VERSION,
@@ -156,6 +157,7 @@ module.exports = class App {
         'cyphernode/otsclient': this.sessionData.otsclient_version,
         'traefik': this.sessionData.traefik_version,
         'cyphernode/clightning': this.sessionData.lightning_version,
+        'cyphernode/barkd': this.sessionData.barkd_version,
         'cyphernode/notifier': this.sessionData.notifier_version,
         'eclipse-mosquitto': this.sessionData.mosquitto_version,
         'cyphernode/paymentalist': this.sessionData.paymentalist_version
@@ -361,6 +363,9 @@ module.exports = class App {
     if( (this.config.data.features || []).includes('elements') && this.config.data.net === 'signet' ) {
       throw new Error('Elements does not support signet. Select another network or remove the Elements feature.');
     }
+    if( (this.config.data.features || []).includes('ark') && this.config.data.net === 'testnet' ) {
+      throw new Error('The Ark wallet does not support testnet. Select signet or another supported network.');
+    }
 
     console.log( chalk.green( '   create' )+' '+configArchiveFileName );
     if( !this.config.serialize(
@@ -380,6 +385,7 @@ module.exports = class App {
       'bitcoin_datapath',
       'elements_datapath',
       'lightning_datapath',
+      'ark_datapath',
       'otsclient_datapath'
     ];
 
@@ -578,6 +584,14 @@ module.exports = class App {
           torified: this.torifyables.find(data => data.value === 'tor_elements').checked,
           clearnet: !this.isChecked('features', 'tor') || this.isChecked('clearnet', 'clearnet_elements'),
           tor_hostname: this.sessionData.tor_elements_hostname
+        }
+      },
+      ark: {
+        networks: ['cyphernodenet'],
+        docker: "cyphernode/barkd:"+this.config.docker_versions['cyphernode/barkd'],
+        extra: {
+          server_url: this.config.data.ark_server_url,
+          network: this.config.data.net
         }
       },
       lightning: {

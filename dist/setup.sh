@@ -138,7 +138,7 @@ sudo_mkdir_if_required() {
 }
 
 modify_permissions() {
-  local directories=("installer" "gatekeeper" "lightning" "bitcoin" "elements" "docker-compose.yaml" "traefik" "tor" "$BITCOIN_DATAPATH" "$ELEMENTS_DATAPATH" "$LIGHTNING_DATAPATH" "$PROXY_DATAPATH" "$GATEKEEPER_DATAPATH" "$OTSCLIENT_DATAPATH" "$POSTGRES_DATAPATH" "$LOGS_DATAPATH" "$TRAEFIK_DATAPATH" "$TOR_DATAPATH")
+  local directories=("installer" "gatekeeper" "lightning" "bitcoin" "elements" "docker-compose.yaml" "traefik" "tor" "$BITCOIN_DATAPATH" "$ELEMENTS_DATAPATH" "$LIGHTNING_DATAPATH" "$ARK_DATAPATH" "$PROXY_DATAPATH" "$GATEKEEPER_DATAPATH" "$OTSCLIENT_DATAPATH" "$POSTGRES_DATAPATH" "$LOGS_DATAPATH" "$TRAEFIK_DATAPATH" "$TOR_DATAPATH")
   for d in "${directories[@]}"
   do
     if [[ -e $d ]]; then
@@ -150,7 +150,7 @@ modify_permissions() {
 }
 
 modify_owner() {
-  local directories=("$BITCOIN_DATAPATH" "$ELEMENTS_DATAPATH" "$LIGHTNING_DATAPATH" "$PROXY_DATAPATH" "$GATEKEEPER_DATAPATH" "$OTSCLIENT_DATAPATH" "$POSTGRES_DATAPATH" "$LOGS_DATAPATH" "$TRAEFIK_DATAPATH" "$TOR_DATAPATH")
+  local directories=("$BITCOIN_DATAPATH" "$ELEMENTS_DATAPATH" "$LIGHTNING_DATAPATH" "$ARK_DATAPATH" "$PROXY_DATAPATH" "$GATEKEEPER_DATAPATH" "$OTSCLIENT_DATAPATH" "$POSTGRES_DATAPATH" "$LOGS_DATAPATH" "$TRAEFIK_DATAPATH" "$TOR_DATAPATH")
   local user=$(id -u $RUN_AS_USER):$(id -g $RUN_AS_USER)
   for d in "${directories[@]}"
   do
@@ -224,6 +224,7 @@ configure() {
              -e ELEMENTS_VERSION=$ELEMENTS_VERSION \
              -e LIGHTNING_VERSION=$LIGHTNING_VERSION \
              -e PAYMENTALIST_VERSION=$PAYMENTALIST_VERSION \
+             -e BARKD_VERSION=$BARKD_VERSION \
              -e CONF_VERSION=$CONF_VERSION \
              -e SETUP_VERSION=$SETUP_VERSION \
              --log-driver=none$pw_env \
@@ -695,6 +696,21 @@ install_docker() {
     fi
   fi
 
+  if [[ $FEATURE_ARK == true ]]; then
+    if ${sudo} [ ! -d $ARK_DATAPATH/data ]; then
+      step "   [32mcreate[0m $ARK_DATAPATH/data"
+      sudo_mkdir_if_required $ARK_DATAPATH/data
+      next
+    fi
+    if ${sudo} [ ! -d $ARK_DATAPATH/token ]; then
+      step "   [32mcreate[0m $ARK_DATAPATH/token"
+      sudo_mkdir_if_required $ARK_DATAPATH/token
+      next
+    fi
+
+    copy_file $cyphernodeconf_filepath/ark/barkd.env $current_path/.env/barkd.env 1
+  fi
+
   if [[ $FEATURE_OTSCLIENT == true ]]; then
     if ${sudo} [ ! -d $OTSCLIENT_DATAPATH ]; then
       step "   [32mcreate[0m $OTSCLIENT_DATAPATH"
@@ -811,7 +827,7 @@ install_docker() {
 
 check_directory_owner() {
   # if one directory does not have access rights for $RUN_AS_USER, we echo 1, else we echo 0
-  local directories=("$BITCOIN_DATAPATH" "$ELEMENTS_DATAPATH" "$LIGHTNING_DATAPATH" "$PROXY_DATAPATH" "$GATEKEEPER_DATAPATH" "$POSTGRES_DATAPATH" "$LOGS_DATAPATH" "$TRAEFIK_DATAPATH" "$TOR_DATAPATH")
+  local directories=("$BITCOIN_DATAPATH" "$ELEMENTS_DATAPATH" "$LIGHTNING_DATAPATH" "$ARK_DATAPATH" "$PROXY_DATAPATH" "$GATEKEEPER_DATAPATH" "$POSTGRES_DATAPATH" "$LOGS_DATAPATH" "$TRAEFIK_DATAPATH" "$TOR_DATAPATH")
   local status=0
   for d in "${directories[@]}"
   do
@@ -915,7 +931,7 @@ sanity_checks_pre_install() {
       if [[ $sudo_reason == 'directories' ]]; then
         echo "          [31mor check your data volumes if they have the right owner.[0m"
         echo "          [31mThe owner of the following folders should be '$RUN_AS_USER':[0m"
-        local directories=("$BITCOIN_DATAPATH" "$ELEMENTS_DATAPATH" "$LIGHTNING_DATAPATH" "$PROXY_DATAPATH" "$GATEKEEPER_DATAPATH" "$POSTGRES_DATAPATH" "$LOGS_DATAPATH" "$TRAEFIK_DATAPATH" "$TOR_DATAPATH")
+        local directories=("$BITCOIN_DATAPATH" "$ELEMENTS_DATAPATH" "$LIGHTNING_DATAPATH" "$ARK_DATAPATH" "$PROXY_DATAPATH" "$GATEKEEPER_DATAPATH" "$POSTGRES_DATAPATH" "$LOGS_DATAPATH" "$TRAEFIK_DATAPATH" "$TOR_DATAPATH")
           local status=0
           for d in "${directories[@]}"
           do
@@ -1016,6 +1032,7 @@ CYPHERAPPS_VERSION="dev"
 BITCOIN_VERSION="v31.1"
 ELEMENTS_VERSION="v23.2.5"
 LIGHTNING_VERSION="v26.06.9"
+BARKD_VERSION="v0.9.0-dev"
 TRAEFIK_VERSION="v2.6.3"
 MOSQUITTO_VERSION="1.6-openssl"
 POSTGRES_VERSION="14.0-bullseye"
@@ -1078,6 +1095,7 @@ if [[ $nbbuiltimgs -gt 1 ]]; then
     OTSCLIENT_VERSION="$OTSCLIENT_VERSION-local"
     PYCOIN_VERSION="$PYCOIN_VERSION-local"
     PAYMENTALIST_VERSION="$PAYMENTALIST_VERSION-local"
+    BARKD_VERSION="$BARKD_VERSION-local"
   fi
 fi
 
