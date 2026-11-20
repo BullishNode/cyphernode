@@ -305,11 +305,13 @@ process_bitcoinconf() {
   local txindexEntry=$(sudo_if_required grep -e ^txindex $bitcoinconf | tr -d '[:space:]')
   local testnetEntry=$(sudo_if_required grep -e ^testnet $bitcoinconf | tr -d '[:space:]')
   local regtestEntry=$(sudo_if_required grep -e ^regtest $bitcoinconf | tr -d '[:space:]')
+  local signetEntry=$(sudo_if_required grep -e ^signet $bitcoinconf | tr -d '[:space:]')
 
   local prune=0
   local txindex=0
   local testnet=0
   local regtest=0
+  local signet=0
 
   if [[ $pruneEntry =~ ^prune && ! $pruneEntry == 'prune=0' ]]; then
     prune=1
@@ -326,11 +328,15 @@ process_bitcoinconf() {
   if [[ $regtestEntry =~ ^regtest && ! $regtestEntry == 'regtest=0' ]]; then
     regtest=1
   fi
+
+  if [[ $signetEntry =~ ^signet && ! $signetEntry == 'signet=0' ]]; then
+    signet=1
+  fi
   #  prune &  txindex: 3
   # !prune &  txindex: 2
   #  prune & !txindex: 1
   # !prune & !txindex: 0
-  echo $(($prune|$txindex<<1|$testnet<<2|$regtest<<3))
+  echo $(($prune|$txindex<<1|$testnet<<2|$regtest<<3|$signet<<4))
 }
 
 

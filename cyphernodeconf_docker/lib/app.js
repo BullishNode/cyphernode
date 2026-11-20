@@ -358,6 +358,10 @@ module.exports = class App {
 
   async writeFiles() {
 
+    if( (this.config.data.features || []).includes('elements') && this.config.data.net === 'signet' ) {
+      throw new Error('Elements does not support signet. Select another network or remove the Elements feature.');
+    }
+
     console.log( chalk.green( '   create' )+' '+configArchiveFileName );
     if( !this.config.serialize(
       this.destinationPath(configArchiveFileName),
@@ -455,7 +459,7 @@ module.exports = class App {
           torified: this.torifyables.find(data => data.value === 'tor_bitcoin').checked,
           clearnet: !this.isChecked('features', 'tor') || this.isChecked('clearnet', 'clearnet_bitcoin'),
           tor_hostname: this.sessionData.tor_bitcoin_hostname,
-          port: (this.config.data.net === 'regtest') ? 18444 : ((this.config.data.net === 'testnet') ? 18333 : 8333),
+          port: (this.config.data.net === 'regtest') ? 18444 : ((this.config.data.net === 'testnet') ? 18333 : ((this.config.data.net === 'signet') ? 38333 : 8333)),
           network: this.config.data.net
         }
       },

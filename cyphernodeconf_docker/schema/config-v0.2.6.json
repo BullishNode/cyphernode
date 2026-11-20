@@ -258,6 +258,7 @@
       "enum": [
         "testnet",
         "mainnet",
+        "signet",
         "regtest"
       ],
       "title": "The net cyphernode is running on",

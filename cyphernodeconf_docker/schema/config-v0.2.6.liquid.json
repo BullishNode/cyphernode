@@ -42,6 +42,16 @@
   "allOf": [
     {
       "if": {
+        "required": ["net", "features"],
+        "properties": {
+          "net": {"const": "signet"},
+          "features": {"contains": {"const": "elements"}}
+        }
+      },
+      "then": false
+    },
+    {
+      "if": {
         "properties": {
           "run_as_different_user": {
             "enum": [
@@ -301,6 +311,7 @@
       "enum": [
         "testnet",
         "mainnet",
+        "signet",
         "regtest"
       ],
       "title": "The net cyphernode is running on",
