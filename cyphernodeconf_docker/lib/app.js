@@ -225,7 +225,7 @@ module.exports = class App {
 
         } catch (e) {
           console.log(chalk.bold.red(e));
-          process.exit();
+          process.exit(1);
         }
       } catch( err ) {
         console.log(chalk.bold.red('config archive is corrupt.'));
@@ -280,6 +280,7 @@ module.exports = class App {
     const props = await this.prompt(prompts);
 
     this.config.data = Object.assign(this.config.data, props);
+    this.config.assertArkBitcoinCompatible();
   }
 
   async processProps() {

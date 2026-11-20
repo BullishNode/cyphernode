@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# Unit test for ark_send, ark_board and ark_watch request handling with
+# Unit test for Ark send, board, offboard and watch request handling with
 # stubbed barkd, PostgreSQL and broker. Runs anywhere with sh and jq.
 #
 #   cd proxy_docker/app/script && sh ../tests/test-ark-send.sh
@@ -41,9 +41,11 @@ DEST=ark1qpzry9x8gf2tvdw0s3jn54khce6mua7lqpzry9x8gf2tvdw0s3jn54khce6mua7l
 BARKD_MODE=ok
 CONNECTED=true
 NEW_MOVEMENTS=
+SQL_MODE=ok
 barkd_call() {
   rm -f "$(barkd_http_code_file)"
   printf '%s %s\n' "${1}" "${2}" >> "${BARKD_LOG}"
+  [ "${1}" != POST ] || printf 'barkd POST %s\n' "${2}" >> "${SQL_LOG}"
   if [ "${LOCK_READ_ONCE:-}" = true ] && [ "${2}" = /wallet/connected ] && [ ! -e "${BARKD_LOG}.read-lock" ]; then
     touch "${BARKD_LOG}.read-lock"
     printf 409 > "$(barkd_http_code_file)"
@@ -68,7 +70,8 @@ barkd_call() {
             movements="${movements}"',{"id":6,"status":"successful","sent_to":[{"destination":{"type":"ark","value":"'${DEST}'"},"amount_sat":500}]}'"${NEW_MOVEMENTS}"
           fi
           echo "[${movements}]"; return 0 ;;
-        /boards/board-amount) echo '{"funding_tx":{"txid":"txid-b"},"vtxos":["v1"]}'; return 0 ;;
+        /boards/board-amount) echo '{"funding_tx":{"txid":"txid-b"},"vtxos":["v1"],"movement_id":14}'; return 0 ;;
+        /wallet/offboard/vtxos) echo '{"offboard_txid":"txid-o","movement_id":15}'; return 0 ;;
       esac ;;
     down) rm -f "$(barkd_http_code_file)"; return 1 ;;
     down_after)
@@ -89,8 +92,9 @@ barkd_call() {
         /wallet/connected) echo '{"connected":true}'; return 0 ;;
         /history*) echo '[]'; return 0 ;;
         /wallet/send) printf 409 > "$(barkd_http_code_file)"; echo '{"message":"Insufficient money available. Needed 0.00001000 BTC but 0.00000500 BTC is available"}'; return 2 ;;
-        *) printf 409 > "$(barkd_http_code_file)"; echo '{"message":"insufficient funds"}'; return 2 ;;
+        *) printf 422 > "$(barkd_http_code_file)"; echo '{"message":"insufficient funds"}'; return 2 ;;
       esac ;;
+    server_error) printf 503 > "$(barkd_http_code_file)"; echo '{"message":"service unavailable"}'; return 2 ;;
   esac
 }
 
@@ -98,9 +102,24 @@ sql() {
   printf '%s\n' "${1}" >> "${SQL_LOG}"
   case "${1}" in
     "INSERT INTO ark_job (kind, label, callback_url, vtxos, status) VALUES ('board', 'dupjob'"*) ;;
-    "INSERT INTO ark_job"*) printf '9' ;;
-    "INSERT INTO ark_watching"*) printf '7' ;;
+    "INSERT INTO ark_job (kind, label, callback_url, vtxos, status) VALUES ('offboard', 'dupjob'"*) ;;
+    "INSERT INTO ark_job"*)
+      [ "${SQL_MODE}" != fail_insert ] || return 1
+      printf '9' ;;
+    "UPDATE ark_job"*) [ "${SQL_MODE}" != fail_update ] ;;
+    "SELECT row_to_json(t) FROM (SELECT id, kind, label, status, txid, movement_id, vtxos, callback_url, calledback, error FROM ark_job WHERE label='dupjob') t")
+      printf '%s\n' '{"id":29,"kind":"board","label":"dupjob","status":"successful","txid":"txid-existing","movement_id":23,"vtxos":"[\"existing-vtxo\"]","callback_url":null,"calledback":true,"error":null}' ;;
     *) ;;
+  esac
+}
+
+psql() {
+  local statement
+  statement=$(cat)
+  printf '%s\n' "${statement}" "$@" >> "${SQL_LOG}"
+  [ "${SQL_MODE}" != fail_watch ] || return 1
+  case "${statement}" in
+    "INSERT INTO ark_watching"*) printf '7' ;;
   esac
 }
 
@@ -193,38 +212,110 @@ rm "${BARKD_LOG}.send-lock" "${BARKD_LOG}.read-lock"
 
 BARKD_MODE=ok
 : > "${BARKD_LOG}"
+: > "${SQL_LOG}"
 out=$(ark_board '{"amount":1000,"label":"topup-1","callbackURL":"http://app/job?x=1|2"}')
 check "board records the job before barkd is called" \
-  "jqcheck '${out}' '.id == 9 and .txid == \"txid-b\" and .vtxos == [\"v1\"]' && grep -n 'INSERT INTO ark_job\|UPDATE ark_job SET txid' '${SQL_LOG}' | sort -n | head -1 | grep -q 'INSERT'"
-check "board stores the funding txid and vtxos" \
-  "grep -q \"UPDATE ark_job SET txid='txid-b', vtxos='\\[\\\"v1\\\"\\]' WHERE id=9\" '${SQL_LOG}'"
+  "jqcheck '${out}' '.id == 9 and .txid == \"txid-b\" and .vtxos == [\"v1\"] and .movementId == 14' &&
+   sed -n '1p' '${SQL_LOG}' | grep -q '^INSERT INTO ark_job' &&
+   grep -Fxq 'barkd POST /boards/board-amount' '${SQL_LOG}'"
+check "board binds the funding txid, VTXOs and movement ID" \
+  "grep -Fq \"UPDATE ark_job SET txid='txid-b', vtxos='[\\\"v1\\\"]', movement_id=COALESCE(14, movement_id) WHERE id=9\" '${SQL_LOG}'"
 
+: > "${BARKD_LOG}"
 out=$(ark_board '{"amount":1000,"label":"dupjob"}')
-check "duplicate job label is refused and never reaches barkd" \
-  "jqcheck '${out}' '.error.message == \"duplicate label\"' && grep -c 'POST /boards/board-amount' '${BARKD_LOG}' | grep -q '^1$'"
+check "retry of the same board label returns the completed original job" \
+  "jqcheck '${out}' '.id == 29 and .label == \"dupjob\" and .status == \"successful\" and .movementId == 23 and .vtxos == [\"existing-vtxo\"]' &&
+   [ ! -s '${BARKD_LOG}' ]"
 
+out=$(ark_offboard '{"vtxos":["original-vtxo"],"label":"dupjob"}')
+check "an offboard cannot reuse a board label" \
+  "jqcheck '${out}' '.error.code == -32000' && [ ! -s '${BARKD_LOG}' ]"
+
+: > "${SQL_LOG}"
 BARKD_MODE=refused
 out=$(ark_board '{"amount":1000,"label":"topup-2"}')
-check "refused board is marked failed with barkd's message" \
-  "jqcheck '${out}' '.error.code == 409' && grep -q \"UPDATE ark_job SET status='failed', error='insufficient funds' WHERE id=9\" '${SQL_LOG}'"
+check "definitive board refusal records the failure" \
+  "jqcheck '${out}' '.error.code == 422' && grep -Fq \"UPDATE ark_job SET status='failed', error='insufficient funds' WHERE id=9 AND status='pending'\" '${SQL_LOG}'"
+
+: > "${SQL_LOG}"
+: > "${BARKD_LOG}"
+BARKD_MODE=down
+out=$(ark_board '{"amount":1000,"label":"topup-timeout"}')
+check "board transport timeout keeps the original label pending" \
+  "jqcheck '${out}' '.id == 9 and .label == \"topup-timeout\" and .status == \"pending\" and .error.code == -32001' &&
+   [ \"\$(grep -c '^POST /boards/board-amount$' '${BARKD_LOG}')\" -eq 1 ] &&
+   ! grep -q 'UPDATE ark_job' '${SQL_LOG}'"
+
+: > "${SQL_LOG}"
+: > "${BARKD_LOG}"
+BARKD_MODE=server_error
+out=$(ark_offboard '{"vtxos":["original-vtxo"],"label":"exit-server-error"}')
+check "offboard HTTP 503 keeps the original label pending" \
+  "jqcheck '${out}' '.id == 9 and .label == \"exit-server-error\" and .status == \"pending\" and .error.code == -32001' &&
+   [ \"\$(grep -c '^POST /wallet/offboard/vtxos$' '${BARKD_LOG}')\" -eq 1 ] &&
+   ! grep -q 'UPDATE ark_job' '${SQL_LOG}'"
+
 BARKD_MODE=ok
+: > "${BARKD_LOG}"
+SQL_MODE=fail_insert
+out=$(ark_board '{"amount":1000,"label":"topup-no-insert"}')
+check "failed job insertion prevents submission" \
+  "jqcheck '${out}' '.error.code == -32002' && [ ! -s '${BARKD_LOG}' ]"
+
+SQL_MODE=fail_update
+out=$(ark_offboard '{"vtxos":["original-vtxo"],"label":"exit-no-binding"}')
+check "failed receipt binding reports the active offboard pending" \
+  "jqcheck '${out}' '.id == 9 and .label == \"exit-no-binding\" and .status == \"pending\" and .error.code == -32001' &&
+   [ \"\$(grep -c '^POST /wallet/offboard/vtxos$' '${BARKD_LOG}')\" -eq 1 ]"
+SQL_MODE=ok
 
 # --- ark_watch ---------------------------------------------------------------
 
-out=$(ark_watchrequest '{"address":"tark1qpzry9x8gf2tvdw0s3jn54khce6mua7lqpzry9x8gf2tvdw0s3jn54khce6mua7l","callbackURL":"http://app/cb","label":"o-1","eventMessage":"ZQ==","expectedAmount":100}')
+: > "${SQL_LOG}"
+out=$(ark_watchrequest '{"address":"t'${DEST}'","callbackURL":"http://app/cb","label":"o-1","eventMessage":"ZQ==","expectedAmount":100}')
 check "watch is inserted and echoed" \
   "jqcheck '${out}' '.id == 7 and .inserted == true and .expectedAmount == 100 and .eventMessage == \"ZQ==\"'"
-check "watch upserts on address and callback" \
-  "grep -q \"ON CONFLICT (address, COALESCE(callback_url, '')) DO UPDATE SET watching=true\" '${SQL_LOG}'"
+check "watch binds the address and callback for the upsert" \
+  "grep -Fq \"VALUES (:'address', true, NULLIF(:'callback', '')\" '${SQL_LOG}' &&
+   grep -Fq \"ON CONFLICT (address, COALESCE(callback_url, '')) DO UPDATE SET\" '${SQL_LOG}' &&
+   grep -Fxq 'address=t${DEST}' '${SQL_LOG}' && grep -Fxq 'callback=http://app/cb' '${SQL_LOG}'"
 
+: > "${SQL_LOG}"
 out=$(ark_watchrequest '{"address":"1BitcoinAddress","callbackURL":"http://app/cb"}')
-check "watch refuses a non-Ark address" "jqcheck '${out}' '.error.code == -5'"
+check "watch refuses a non-Ark address before SQL" \
+  "jqcheck '${out}' '.error.code == -5' && [ ! -s '${SQL_LOG}' ]"
+
+newline_request=$(jq -cn --arg address "t${DEST}" '{address: ($address + "\n")}')
+out=$(ark_watchrequest "${newline_request}")
+check "watch refuses a trailing newline before SQL" \
+  "jqcheck '${out}' '.error.code == -5' && [ ! -s '${SQL_LOG}' ]"
+
+with_extra_line="t${DEST}
+extra-line"
+out=$(ark_unwatchrequest "" "${with_extra_line}" "")
+check "unwatch refuses a multiline address before SQL" \
+  "jqcheck '${out}' '.error.code == -5' && [ ! -s '${SQL_LOG}' ]"
+
+out=$(ark_unwatchrequest "" "t${DEST}" "http://app/cb")
+check "unwatch by address binds the address and callback" \
+  "jqcheck '${out}' '.address == \"t${DEST}\" and .callbackURL == \"http://app/cb\"' &&
+   grep -Fq \"WHERE address=:'address'\" '${SQL_LOG}' &&
+   grep -Fq \"callback_url=:'callback'\" '${SQL_LOG}' &&
+   grep -Fxq 'address=t${DEST}' '${SQL_LOG}' && grep -Fxq 'callback=http://app/cb' '${SQL_LOG}'"
 
 out=$(ark_unwatchrequest "12" "" "")
-check "unwatch by id" "jqcheck '${out}' '.id == 12' && grep -q 'UPDATE ark_watching SET watching=false WHERE id=12' '${SQL_LOG}'"
+check "unwatch by id binds the numeric id" \
+  "jqcheck '${out}' '.id == 12' && grep -Fq \"WHERE id=:'id'::integer\" '${SQL_LOG}' && grep -Fxq 'id=12' '${SQL_LOG}'"
 
-out=$(ark_unwatchrequest "1 OR true" "" "")
-check "unwatch refuses a non-integer id" \
-  "jqcheck '${out}' '.error.code == -32602' && ! grep -q 'WHERE id=1 OR true' '${SQL_LOG}'"
+: > "${SQL_LOG}"
+out=$(ark_unwatchrequest "not-an-id" "" "")
+check "unwatch refuses a non-integer id before SQL" \
+  "jqcheck '${out}' '.error.code == -32602' && [ ! -s '${SQL_LOG}' ]"
+
+SQL_MODE=fail_watch
+watch_rc=0
+out=$(ark_watchrequest '{"address":"t'${DEST}'"}') || watch_rc=$?
+check "failed watch insert cannot report success" \
+  "[ '${watch_rc}' -ne 0 ] && jqcheck '${out}' '.id == null and .inserted == false'"
 
 exit ${fail}

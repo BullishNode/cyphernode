@@ -16,6 +16,13 @@ sql_json() {
   sql "SELECT row_to_json(t) FROM (${1}) t"
 }
 
+# Read the statement from stdin so psql can quote Ark SQL literal variables.
+sql_params() {
+  local statement=${1}
+  shift
+  printf '%s\n' "${statement}" | psql -qAtX -v ON_ERROR_STOP=1 -h postgres -U cyphernode "$@"
+}
+
 # A locked wallet database is a transient read failure under concurrent
 # barkd requests. Reads have no payment side effect and can be retried.
 ark_barkd_read() {
@@ -40,8 +47,14 @@ ark_database_locked() {
     grep -qi 'database is locked'
 }
 
+ARK_ADDRESS_PATTERN='\A(ark|tark)1[ac-hj-np-z02-9]{20,}\z'
+
 ark_is_address() {
-  printf '%s' "${1}" | grep -Eq '^(ark|tark)1[ac-hj-np-z02-9]{20,}$'
+  jq -en --arg address "${1}" --arg pattern "${ARK_ADDRESS_PATTERN}" '$address | test($pattern)' > /dev/null
+}
+
+ark_request_address() {
+  printf '%s' "${1}" | jq -er --arg pattern "${ARK_ADDRESS_PATTERN}" '.address | strings | select(test($pattern))'
 }
 
 ark_getinfo() {
@@ -266,7 +279,7 @@ ark_board() {
 
   local request=${1}
   local amount all label callback_url
-  local response returncode txid vtxos id
+  local response returncode txid vtxos movement_id id
 
   amount=$(printf '%s' "${request}" | jq -r '.amount // empty')
   all=$(printf '%s' "${request}" | jq -r '.all // false')
@@ -281,7 +294,12 @@ ark_board() {
         ;;
     esac
   fi
-  id=$(ark_job_insert board "${label}" "${callback_url}") || { printf '%s' "${id}"; return 1; }
+  id=$(ark_job_insert board "${label}" "${callback_url}")
+  case $? in
+    0) ;;
+    2) ark_getjob "${label}" board; return $? ;;
+    *) printf '%s' "${id}"; return 1 ;;
+  esac
 
   if [ "${all}" = "true" ]; then
     response=$(barkd_call POST /boards/board-all)
@@ -291,17 +309,21 @@ ark_board() {
     returncode=$?
   fi
   if [ "${returncode}" -ne 0 ]; then
-    ark_job_fail "${id}" "${returncode}" "${response}"
+    ark_job_fail "${id}" "${returncode}" "${response}" "${label}"
     return 1
   fi
 
   txid=$(printf '%s' "${response}" | jq -r '.funding_tx.txid // empty')
   vtxos=$(printf '%s' "${response}" | jq -c '.vtxos // []')
-  sql "UPDATE ark_job SET txid='${txid}', vtxos='$(sql_quote "${vtxos}")' WHERE id=${id}" > /dev/null
+  movement_id=$(printf '%s' "${response}" | jq -r '.movement_id | numbers | select(. >= 0 and floor == .)')
+  if ! sql "UPDATE ark_job SET txid='$(sql_quote "${txid}")', vtxos='$(sql_quote "${vtxos}")', movement_id=COALESCE(${movement_id:-NULL}, movement_id) WHERE id=${id}" > /dev/null; then
+    ark_job_unknown "${id}" "${label}"
+    return 1
+  fi
 
   jq -cn --argjson id "${id}" --arg lbl "${label}" --arg txid "${txid}" --argjson vtxos "${vtxos}" \
-    --arg cb "${callback_url}" \
-    '{id: $id, event: "ark_board", "label": $lbl, status: "pending", txid: $txid, vtxos: $vtxos, callbackURL: (if $cb == "" then null else $cb end)}'
+    --arg cb "${callback_url}" --argjson m "${movement_id:-null}" \
+    '{id: $id, event: "ark_board", "label": $lbl, status: "pending", txid: $txid, movementId: $m, vtxos: $vtxos, callbackURL: (if $cb == "" then null else $cb end)}'
 }
 
 # ark_offboard: {"vtxos":["..."],"address":"bc1...","label":"exit-1","callbackURL":"..."} or {"all":true,...}
@@ -322,7 +344,12 @@ ark_offboard() {
     echo '{"error":{"code":-32602,"message":"vtxos must be a non-empty list, or all must be true"}}'
     return 1
   fi
-  id=$(ark_job_insert offboard "${label}" "${callback_url}" "${vtxos}") || { printf '%s' "${id}"; return 1; }
+  id=$(ark_job_insert offboard "${label}" "${callback_url}" "${vtxos}")
+  case $? in
+    0) ;;
+    2) ark_getjob "${label}" offboard; return $? ;;
+    *) printf '%s' "${id}"; return 1 ;;
+  esac
 
   if [ "${all}" = "true" ]; then
     body=$(jq -cn --arg a "${address}" '{address: (if $a == "" then null else $a end)}')
@@ -334,13 +361,16 @@ ark_offboard() {
     returncode=$?
   fi
   if [ "${returncode}" -ne 0 ]; then
-    ark_job_fail "${id}" "${returncode}" "${response}"
+    ark_job_fail "${id}" "${returncode}" "${response}" "${label}"
     return 1
   fi
 
   txid=$(printf '%s' "${response}" | jq -r '.offboard_txid // empty')
-  movement_id=$(printf '%s' "${response}" | jq -r '.movement_id // empty')
-  sql "UPDATE ark_job SET txid='${txid}', movement_id=${movement_id:-NULL} WHERE id=${id}" > /dev/null
+  movement_id=$(printf '%s' "${response}" | jq -r '.movement_id | numbers | select(. >= 0 and floor == .)')
+  if ! sql "UPDATE ark_job SET txid='$(sql_quote "${txid}")', movement_id=COALESCE(${movement_id:-NULL}, movement_id) WHERE id=${id}" > /dev/null; then
+    ark_job_unknown "${id}" "${label}"
+    return 1
+  fi
 
   jq -cn --argjson id "${id}" --arg lbl "${label}" --arg txid "${txid}" --argjson m "${movement_id:-null}" \
     --arg cb "${callback_url}" \
@@ -362,20 +392,44 @@ ark_job_insert() {
     return 1
   fi
   [ -n "${callback_url}" ] && callback_pg="'$(sql_quote "${callback_url}")'"
-  id=$(sql "INSERT INTO ark_job (kind, label, callback_url, vtxos, status) VALUES ('${kind}', '$(sql_quote "${label}")', ${callback_pg}, '$(sql_quote "${vtxos}")', 'pending') ON CONFLICT (label) DO NOTHING RETURNING id")
-  if [ -z "${id}" ]; then
-    echo '{"error":{"code":-32000,"message":"duplicate label"}}'
+  if ! id=$(sql "INSERT INTO ark_job (kind, label, callback_url, vtxos, status) VALUES ('${kind}', '$(sql_quote "${label}")', ${callback_pg}, '$(sql_quote "${vtxos}")', 'pending') ON CONFLICT (label) DO NOTHING RETURNING id"); then
+    echo '{"error":{"code":-32002,"message":"Could not record Ark job"}}'
     return 1
+  fi
+  if [ -z "${id}" ]; then
+    return 2
   fi
   printf '%s' "${id}"
 }
 
-# ark_job_fail <job id> <barkd_call rc> <barkd body>
+ark_request_refused() {
+  [ "${1}" -eq 2 ] || return 1
+  case "$(barkd_http_code)" in
+    408|409|429) return 1 ;;
+    4[0-9][0-9]) ! ark_database_locked "${2}" ;;
+    *) return 1 ;;
+  esac
+}
+
+ark_job_unknown() {
+  jq -cn --argjson id "${1}" --arg label "${2}" \
+    '{id: $id, label: $label, status: "pending", error: {code: -32001,
+      message: "Ark job outcome is unknown. Check ark_getjob with the original label."}}'
+}
+
+# ark_job_fail <job id> <barkd_call rc> <barkd body> <label>
 ark_job_fail() {
+  if ! ark_request_refused "${2}" "${3}"; then
+    ark_job_unknown "${1}" "${4}"
+    return 1
+  fi
   local message
   message=$(printf '%s' "${3}" | jq -r '.message // .error // "request failed"' 2>/dev/null)
   [ -z "${message}" ] && message="barkd unreachable"
-  sql "UPDATE ark_job SET status='failed', error='$(sql_quote "${message}")' WHERE id=${1}" > /dev/null
+  if ! sql "UPDATE ark_job SET status='failed', error='$(sql_quote "${message}")' WHERE id=${1} AND status='pending'" > /dev/null; then
+    ark_job_unknown "${1}" "${4}"
+    return 1
+  fi
   barkd_error "${2}" "${3}"
 }
 
@@ -383,9 +437,13 @@ ark_getjob() {
   trace "Entering ark_getjob(${1})..."
 
   local row
-  row=$(sql_json "SELECT id, kind, label, status, txid, movement_id, vtxos, callback_url, calledback, error FROM ark_job WHERE label='$(sql_quote "${1}")'")
+  row=$(sql_json "SELECT id, kind, label, status, txid, movement_id, vtxos, callback_url, calledback, error FROM ark_job WHERE label='$(sql_quote "${1}")'") || return 1
   if [ -z "${row}" ]; then
     echo '{"error":{"code":-32602,"message":"job not found"}}'
+    return 1
+  fi
+  if [ -n "${2:-}" ] && [ "$(printf '%s' "${row}" | jq -r '.kind')" != "${2}" ]; then
+    echo '{"error":{"code":-32000,"message":"Label already belongs to another Ark job"}}'
     return 1
   fi
   ark_job_row_json "${row}"
@@ -406,6 +464,11 @@ ark_job_row_json() {
 
 ark_is_bolt11() {
   printf '%s' "${1}" | grep -Eiq '^ln(bc|tb|tbs|bcrt)[0-9]*[munp]?1[ac-hj-np-z02-9]+$'
+}
+
+ark_is_payment_hash() {
+  [ "${#1}" -eq 64 ] || return 1
+  case "${1}" in *[!0-9a-f]*) return 1 ;; esac
 }
 
 # ark_bolt11_amount_msat <bolt11>
@@ -433,23 +496,24 @@ ark_bolt11_amount_msat() {
 }
 
 # The newest send movement for the payment hash, or for the invoice when no
-# hash is known. An invoice paid on the Ark address in its route hints is not
+# hash is known. Only movements above the optional attempt floor are observed.
+# An invoice paid on the Ark address in its route hints is not
 # a Lightning send: barkd records it as a bark.arkoor send to the invoice.
 ark_ln_find_send_movement() {
   local path=/history
   local history
   [ -n "${2:-}" ] && path="/history?type=invoice&value=${2}"
   history=$(ark_barkd_read "${path}") || return 1
-  printf '%s' "${history}" | jq -c --arg h "${1}" --arg i "${2:-}" '
+  printf '%s' "${history}" | jq -c --arg h "${1}" --arg i "${2:-}" --argjson floor "${3:--1}" '
     if type == "array" then
-      [ .[] | select(
+      [ .[] | select(.id > $floor) | select(
           (.subsystem.name == "bark.lightning_send" and
             (if $h != "" then .metadata.payment_hash == $h
              else $i != "" and any(.sent_to[]?; .destination.value == $i) end))
           or ($i != "" and .subsystem.name == "bark.arkoor" and .subsystem.kind == "send"
               and any(.sent_to[]?; .destination.value == $i))) ]
       | max_by(.id) // empty
-    else empty end'
+    else error("invalid wallet history") end'
 }
 
 # ark_ln_send_reply <status> <payment hash> <destination> <amount msat> [movement json] [already paid]
@@ -464,20 +528,45 @@ ark_ln_send_reply() {
 }
 
 # ark_ln_send_finish <payment hash> <complete|failed> [movement id]
-# Records the outcome and publishes the eventMessage once: the row is claimed
-# with published=true in the same statement, so the movement loop and
-# ark_lnpay cannot both publish.
+# While a send is pending, movement_id holds the last movement seen before
+# submission. A terminal movement replaces that floor only if it is newer.
 ark_ln_send_finish() {
-  local event_message
-
   [ -n "${1}" ] || return 0
-  event_message=$(sql "UPDATE ark_ln_send SET status='${2}', movement_id=${3:-NULL}, published=true"\
-" WHERE payment_hash='$(sql_quote "${1}")' AND NOT published RETURNING COALESCE(event_message, '')")
-  [ -n "${event_message}" ] || return 0
+  case "${2}" in complete|failed) ;; *) return 1 ;; esac
+  case "${3:-}" in *[!0-9]*) return 1 ;; esac
+  sql "UPDATE ark_ln_send SET status='${2}', movement_id=${3:-NULL}, published=(COALESCE(event_message, '') = '')"\
+" WHERE payment_hash='$(sql_quote "${1}")' AND status='pending'"\
+" AND (${3:-NULL} IS NULL OR movement_id IS NULL OR movement_id < ${3:-NULL})" > /dev/null
+}
 
-  trace "[ark_ln_send_finish] mosquitto_pub -h broker -t ark_lnpay"
-  mosquitto_pub -h broker -t ark_lnpay -m "$(jq -cn --arg h "${1}" --arg s "${2}" --argjson m "${3:-null}" --arg e "${event_message}" \
-    '{payment_hash: $h, movementId: $m, status: $s, eventMessage: $e}')"
+# Called under the callback worker's lock. MQTT QoS 1 acknowledges delivery
+# to the broker, so a failed send remains in the outbox for another attempt.
+ark_ln_publish_pending() {
+  local rows row id payload failed=0
+  rows=$(sql_json "SELECT id, payment_hash, movement_id, status, event_message FROM ark_ln_send
+    WHERE NOT published AND status IN ('complete', 'failed') ORDER BY id") || return 1
+  local IFS="
+"
+  for row in ${rows}; do
+    id=$(printf '%s' "${row}" | jq -er '.id | numbers | select(. > 0 and floor == .)') || return 1
+    if [ "$(printf '%s' "${row}" | jq -r '.event_message // empty')" ]; then
+      payload=$(printf '%s' "${row}" | jq -c '{payment_hash, movementId: .movement_id, status, eventMessage: .event_message}') || return 1
+      if ! mosquitto_pub -h broker -t ark_lnpay -m "${payload}" -q 1; then
+        failed=1
+        continue
+      fi
+    fi
+    sql "UPDATE ark_ln_send SET published=true WHERE id=${id} AND status IN ('complete', 'failed')" > /dev/null || failed=1
+  done
+  return "${failed}"
+}
+
+ark_ln_send_begin() {
+  sql "INSERT INTO ark_ln_send (payment_hash, destination, event_message, status, movement_id)"\
+" VALUES ('$(sql_quote "${1}")', '$(sql_quote "${2}")', ${3}, 'pending', ${4})"\
+" ON CONFLICT (payment_hash) DO UPDATE SET destination=EXCLUDED.destination, event_message=EXCLUDED.event_message,"\
+" status='pending', movement_id=EXCLUDED.movement_id, published=false"\
+" WHERE ark_ln_send.status='failed' AND ark_ln_send.published RETURNING id"
 }
 
 # ark_lnpay: {"destination":"lnbc...","expected_msatoshi":"40000000","expected_description":"order #1","eventMessage":"eyJ..."}
@@ -519,54 +608,14 @@ ark_server_pubkey() {
   printf '%s' "${key}"
 }
 
-# CLN decode exposes invoice route hints as one-hop routes. Ark encodes its
-# marker in the first four bytes of the short channel id: "ark\x01" or
-# "ark\x02". CLN may render that id as a decimal blockxtransactionxoutput
-# string, a hex string, or a JSON number.
-ark_bolt11_has_hint() {
-  printf '%s' "${1}" | jq -e '
-    any((.routes // .route_hints // [])[];
-      (type == "array" and length == 1) and
-      (.[0].short_channel_id as $id |
-        if ($id | type) == "number" then
-          (($id / 4294967296 | floor) == 1634888449 or ($id / 4294967296 | floor) == 1634888450)
-        elif ($id | type) == "string" then
-          ($id | test("^0[xX]61726[bB]0[12][0-9a-fA-F]{8}$")) or
-          (($id | split("x")) as $parts | ($parts | length) == 3 and
-            $parts[0] == "6386283" and (($parts[1] | tonumber) >= 65536) and
-            (($parts[1] | tonumber) < 196608))
-        else false end))' >/dev/null 2>&1
-}
-
-# A hinted invoice must be checked against this wallet's Ark server before
-# payment. Missing server information or a paymentalist failure is an error.
-ark_bolt11_address() {
-  local bolt11=${1}
-  local server result address
-
-  server=$(ark_server_pubkey) || return 1
-  [ -n "${server}" ] || return 1
-  result=$(check_bolt11_mrh "${bolt11}" "" "${server}")
-  address=$(printf '%s' "${result}" | jq -er '.result.ark_address | select(type == "string" and length > 0)' 2>/dev/null)
-  if [ -n "${address}" ]; then
-    printf '%s' "${address}"
-    return 0
-  fi
-  # A changed server key invalidates the old route hint. Refresh only when
-  # validation fails, then verify again against the new key.
-  server=$(ark_server_pubkey refresh) || return 1
-  result=$(check_bolt11_mrh "${bolt11}" "" "${server}") || return 1
-  printf '%s' "${result}" | jq -er '.result.ark_address | select(type == "string" and length > 0)' 2>/dev/null
-}
-
 ark_lnpay() (
   trace "Entering ark_lnpay()..."
 
   local request=${1}
   local destination expected_msatoshi expected_description event_message
   local bolt11 invoice_msat amount_sat payment_hash decoded description event_pg
-  local connected movement response returncode message body
-  local deadline status send
+  local connected movement response returncode message body insufficient=
+  local deadline status send attempt_floor=-1 attempt_id= prior_status
 
   destination=$(printf '%s' "${request}" | jq -r '.destination // .bolt11 // empty')
   expected_msatoshi=$(printf '%s' "${request}" | jq -r '.expected_msatoshi // .expectedMsatoshi // empty')
@@ -642,6 +691,14 @@ ark_lnpay() (
 
   # Already paid or in flight: only an invoice can be looked up before paying.
   if [ -n "${bolt11}" ]; then
+    if [ -z "${payment_hash}" ]; then
+      send=$(ark_barkd_read "/lightning/sends/${bolt11}") || return 1
+      payment_hash=$(printf '%s' "${send}" | jq -r '.payment_hash // empty')
+    fi
+    if ! ark_is_payment_hash "${payment_hash}"; then
+      echo '{"error":{"code":-32002,"message":"Could not bind invoice to its payment hash"}}'
+      return 1
+    fi
     movement=$(ark_ln_find_send_movement "${payment_hash}" "${bolt11}") || {
       echo '{"error":{"code":-32001,"message":"Ark payment history unavailable; nothing was sent"}}'
       return 1
@@ -656,6 +713,8 @@ ark_lnpay() (
         return 1
         ;;
     esac
+    attempt_floor=$(printf '%s' "${movement:-null}" | jq -r '.id // -1') || return 1
+    case "${attempt_floor}" in -1) ;; ''|*[!0-9]*) return 1 ;; esac
   fi
 
   # barkd reports a lost server connection as an invalid destination.
@@ -673,10 +732,15 @@ ark_lnpay() (
   # Store the callback before barkd can accept the payment and emit a movement.
   event_pg=NULL; [ -n "${event_message}" ] && event_pg="'$(sql_quote "${event_message}")'"
   if [ -n "${payment_hash}" ]; then
-    if ! sql "INSERT INTO ark_ln_send (payment_hash, destination, event_message, status) VALUES ('${payment_hash}', '$(sql_quote "${destination}")', ${event_pg}, 'pending')"\
-" ON CONFLICT (payment_hash) DO UPDATE SET destination=EXCLUDED.destination, event_message=EXCLUDED.event_message, status='pending', movement_id=NULL, published=false" > /dev/null; then
+    if ! attempt_id=$(ark_ln_send_begin "${payment_hash}" "${destination}" "${event_pg}" "${attempt_floor}"); then
       echo '{"error":{"code":-32002,"message":"Could not record Ark payment; nothing was sent"}}'
       return 1
+    fi
+    if [ -z "${attempt_id}" ]; then
+      prior_status=$(sql "SELECT status FROM ark_ln_send WHERE payment_hash='${payment_hash}'") || return 1
+      case "${prior_status}" in complete|failed|pending) ;; *) return 1 ;; esac
+      ark_ln_send_reply "${prior_status}" "${payment_hash}" "${destination}" "${invoice_msat:-${expected_msatoshi}}" '' true
+      return 0
     fi
   fi
 
@@ -690,36 +754,34 @@ ark_lnpay() (
     return 1
   fi
   if [ "${returncode}" -ne 0 ]; then
-    if ark_database_locked "${response}"; then
-      # A hinted invoice may be an Ark send with a fresh action id. Its
-      # movement can appear after this response, so leave the saved row
-      # pending and do not submit the invoice a second time.
-      echo '{"error":{"code":-32001,"message":"Lightning payment outcome unknown after a wallet lock; check ark_listmovements"}}'
-      return 1
-    fi
     message=$(printf '%s' "${response}" | jq -r '.message // empty' 2>/dev/null)
     case "${message}" in
       "Insufficient money available"*)
+        insufficient=1
         trace "[ark_lnpay] mosquitto_pub -h broker -t insufficientfunds"
         mosquitto_pub -h broker -t insufficientfunds -m "$(jq -cn --arg m "${message}" '{method: "ark_lnpay", error: $m}')"
         ;;
     esac
-    [ -n "${payment_hash}" ] && ark_ln_send_finish "${payment_hash}" failed
+    if [ -n "${insufficient}" ] || ark_request_refused "${returncode}" "${response}"; then
+      ark_ln_send_finish "${payment_hash}" failed || return 1
+    else
+      echo '{"error":{"code":-32001,"message":"Lightning payment outcome unknown; check ark_listmovements before retrying"}}'
+      return 1
+    fi
     barkd_error "${returncode}" "${response}"
     return 1
   fi
 
   [ -z "${payment_hash}" ] && payment_hash=$(printf '%s' "${response}" | jq -r '.payment_hash // empty')
-  if [ -z "${payment_hash}" ]; then
+  if ! ark_is_payment_hash "${payment_hash}"; then
     ark_ln_send_reply pending "" "${destination}" "${invoice_msat:-${expected_msatoshi}}"
     return 0
   fi
 
   # When CLN could not decode a hash (for an offer or Lightning address),
   # barkd's response supplies it and the row can only be keyed at this point.
-  if [ -z "${bolt11}" ] || [ "${FEATURE_LIGHTNING}" != "true" ]; then
-    if ! sql "INSERT INTO ark_ln_send (payment_hash, destination, event_message, status) VALUES ('${payment_hash}', '$(sql_quote "${destination}")', ${event_pg}, 'pending')"\
-" ON CONFLICT (payment_hash) DO UPDATE SET destination=EXCLUDED.destination, event_message=EXCLUDED.event_message, status='pending', movement_id=NULL, published=false" > /dev/null; then
+  if [ -z "${attempt_id}" ]; then
+    if ! attempt_id=$(ark_ln_send_begin "${payment_hash}" "${destination}" "${event_pg}" "${attempt_floor}") || [ -z "${attempt_id}" ]; then
       echo '{"error":{"code":-32001,"message":"Payment was submitted but could not be recorded; outcome unknown; check ark_listmovements"}}'
       return 1
     fi
@@ -729,13 +791,15 @@ ark_lnpay() (
   # failure is read from the movement.
   deadline=$(( $(date +%s) + ${ARK_LNPAY_WAIT:-85} ))
   status=pending
+  movement=
   while :; do
+    movement=$(ark_ln_find_send_movement "${payment_hash}" "${bolt11}" "${attempt_floor}") || movement=
     send=$(ark_barkd_read "/lightning/sends/${payment_hash}")
-    if [ "$?" -eq 0 ] && [ "$(printf '%s' "${send}" | jq -r '.state')" = "paid" ]; then
+    if [ "$?" -eq 0 ] && [ "$(printf '%s' "${movement}" | jq -r '.status')" = "successful" ] &&
+       [ "$(printf '%s' "${send}" | jq -r '.state')" = "paid" ]; then
       status=complete
       break
     fi
-    movement=$(ark_ln_find_send_movement "${payment_hash}" "${bolt11}")
     if [ "$(printf '%s' "${movement}" | jq -r '.status // empty')" = "failed" ]; then
       status=failed
       break
@@ -751,8 +815,7 @@ ark_lnpay() (
   trace "[ark_lnpay] payment_hash=${payment_hash} status=${status}"
 
   if [ "${status}" != "pending" ]; then
-    [ "${status}" = "complete" ] && movement=$(ark_ln_find_send_movement "${payment_hash}" "${bolt11}")
-    ark_ln_send_finish "${payment_hash}" "${status}" "$(printf '%s' "${movement}" | jq -r '.id // empty')"
+    ark_ln_send_finish "${payment_hash}" "${status}" "$(printf '%s' "${movement}" | jq -r '.id // empty')" || return 1
   fi
 
   ark_ln_send_reply "${status}" "${payment_hash}" "${destination}" "${invoice_msat:-${expected_msatoshi}}" "${movement}"
@@ -772,7 +835,7 @@ ark_lncreateinvoice() {
   local request=${1}
   local msatoshi label description expiry callback_url event_message
   local amount_sat callback_pg event_pg description_pg expires_pg
-  local id body response returncode bolt11 decoded info payment_hash expires_at
+  local id body response returncode bolt11 decoded info payment_hash expires_at bound
 
   msatoshi=$(printf '%s' "${request}" | jq -r '.msatoshi // empty')
   label=$(printf '%s' "${request}" | jq -r '.label // empty')
@@ -808,7 +871,7 @@ ark_lncreateinvoice() {
   description_pg=NULL; [ -n "${description}" ] && description_pg="'$(sql_quote "${description}")'"
   id=$(sql "INSERT INTO ark_ln_invoice (label, amount_sat, description, callback_url, event_message, status)"\
 " VALUES ('$(sql_quote "${label}")', ${amount_sat}, ${description_pg}, ${callback_pg}, ${event_pg}, 'unpaid')"\
-" ON CONFLICT (label) DO NOTHING RETURNING id")
+" ON CONFLICT (label) DO NOTHING RETURNING id") || return 1
   if [ -z "${id}" ]; then
     echo '{"error":{"code":-32000,"message":"duplicate label"}}'
     return 1
@@ -820,11 +883,19 @@ ark_lncreateinvoice() {
   returncode=$?
   trace "[ark_lncreateinvoice] response=${response}"
   if [ "${returncode}" -ne 0 ]; then
-    sql "DELETE FROM ark_ln_invoice WHERE id=${id}" > /dev/null
-    barkd_error "${returncode}" "${response}"
+    if ark_request_refused "${returncode}" "${response}"; then
+      sql "DELETE FROM ark_ln_invoice WHERE id=${id}" > /dev/null || return 1
+      barkd_error "${returncode}" "${response}"
+    else
+      echo '{"error":{"code":-32001,"message":"Invoice creation outcome is unknown; retain the original label"}}'
+    fi
     return 1
   fi
   bolt11=$(printf '%s' "${response}" | jq -r '.invoice // empty')
+  if ! ark_is_bolt11 "${bolt11}"; then
+    echo '{"error":{"code":-32001,"message":"Barkd did not return a valid invoice"}}'
+    return 1
+  fi
 
   # With the lightning feature, Cyphernode's own CLN decodes the invoice:
   # the payment hash and the exact expiry, which barkd caps at the server's.
@@ -837,14 +908,21 @@ ark_lncreateinvoice() {
     payment_hash=$(printf '%s' "${decoded}" | jq -r '.payment_hash // empty')
     expires_at=$(printf '%s' "${decoded}" | jq -r 'if .created_at and .expiry then .created_at + .expiry else empty end')
   fi
-  if [ -z "${payment_hash}" ]; then
+  if ! ark_is_payment_hash "${payment_hash}"; then
     info=$(ark_barkd_read "/lightning/receives/${bolt11}")
     payment_hash=$(printf '%s' "${info}" | jq -r '.payment_hash // empty')
+  fi
+  if ! ark_is_payment_hash "${payment_hash}"; then
+    echo '{"error":{"code":-32002,"message":"Could not bind the Ark invoice to a durable payment hash"}}'
+    return 1
   fi
   [ -z "${expires_at}" ] && [ -n "${expiry}" ] && expires_at=$(( $(date +%s) + expiry ))
 
   expires_pg=NULL; [ -n "${expires_at}" ] && expires_pg=${expires_at}
-  sql "UPDATE ark_ln_invoice SET bolt11='${bolt11}', payment_hash='${payment_hash}', expires_at=${expires_pg} WHERE id=${id}" > /dev/null
+  if ! bound=$(sql "UPDATE ark_ln_invoice SET bolt11='$(sql_quote "${bolt11}")', payment_hash='${payment_hash}', expires_at=${expires_pg} WHERE id=${id} RETURNING id") || [ "${bound}" != "${id}" ]; then
+    echo '{"error":{"code":-32002,"message":"Could not durably bind the Ark invoice"}}'
+    return 1
+  fi
 
   jq -cn --argjson id "${id}" --arg lbl "${label}" --arg b "${bolt11}" --arg h "${payment_hash}" --argjson msat "${msatoshi}" \
     --arg d "${description}" --arg x "${expires_at}" --arg cb "${callback_url}" \

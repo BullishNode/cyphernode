@@ -88,6 +88,7 @@ module.exports = class Config {
   }
 
   async serialize( path, password ) {
+    this.assertArkBitcoinCompatible();
     this.resolveConfigConflicts();
     this.validate();
     const configJsonString = JSON.stringify(this.data, null, 4);
@@ -135,6 +136,13 @@ module.exports = class Config {
     }
   }
 
+  assertArkBitcoinCompatible() {
+    if( Array.isArray(this.data.features) && this.data.features.includes('ark') &&
+        this.data.bitcoin_mode === 'internal' && this.data.bitcoin_prune === true ) {
+      throw new Error('Ark requires an unpruned Bitcoin Core node with txindex=1. Disable Bitcoin pruning before enabling Ark.');
+    }
+  }
+
   validate() {
     const version = this.data.schema_version || this.data.__version;
 
@@ -145,7 +153,7 @@ module.exports = class Config {
     // this will assign default values from the schema
     this.valid = this.validators[version]( this.data );
     this.validateErrors = this.validators[version].errors;
-
+    this.assertArkBitcoinCompatible();
   }
 
   async migrateFrom(sourceVersion) {
