@@ -412,8 +412,8 @@ ark_request_refused() {
 }
 
 ark_job_unknown() {
-  jq -cn --argjson id "${1}" --arg label "${2}" \
-    '{id: $id, label: $label, status: "pending", error: {code: -32001,
+  jq -cn --argjson id "${1}" --arg job_label "${2}" \
+    '{id: $id, label: $job_label, status: "pending", error: {code: -32001,
       message: "Ark job outcome is unknown. Check ark_getjob with the original label."}}'
 }
 
