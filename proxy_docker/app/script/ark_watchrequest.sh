@@ -14,19 +14,17 @@ ark_watchrequest() {
 
   local request=${1}
   local address callback_url label event_message expected_amount
-  local callback_pg label_pg event_pg expected_pg where_cb
   local id inserted returncode
 
-  address=$(printf '%s' "${request}" | jq -r '.address // empty')
+  if ! address=$(ark_request_address "${request}"); then
+    echo '{"result":null,"error":{"code":-5,"message":"Invalid Ark address","data":{"event":"ark_watch"}}}'
+    return 1
+  fi
   callback_url=$(printf '%s' "${request}" | jq -r '.callbackURL // empty')
   label=$(printf '%s' "${request}" | jq -r '.label // empty')
   event_message=$(printf '%s' "${request}" | jq -r '.eventMessage // empty')
   expected_amount=$(printf '%s' "${request}" | jq -r '.expectedAmount // empty')
 
-  if ! ark_is_address "${address}"; then
-    jq -cn --arg a "${address}" '{result: null, error: {code: -5, message: "Invalid Ark address", data: {event: "ark_watch", address: $a}}}'
-    return 1
-  fi
   if [ -n "${expected_amount}" ]; then
     case "${expected_amount}" in
       *[!0-9]*)
@@ -36,21 +34,13 @@ ark_watchrequest() {
     esac
   fi
 
-  callback_pg=NULL; where_cb=" IS NULL"
-  if [ -n "${callback_url}" ]; then
-    callback_pg="'$(sql_quote "${callback_url}")'"
-    where_cb="=${callback_pg}"
-  fi
-  label_pg=NULL; [ -n "${label}" ] && label_pg="'$(sql_quote "${label}")'"
-  event_pg=NULL; [ -n "${event_message}" ] && event_pg="'$(sql_quote "${event_message}")'"
-  expected_pg=NULL; [ -n "${expected_amount}" ] && expected_pg="${expected_amount}"
-
-  id=$(sql "INSERT INTO ark_watching (address, watching, callback_url, label, event_message, expected_amount_sat)"\
-" VALUES ('${address}', true, ${callback_pg}, ${label_pg}, ${event_pg}, ${expected_pg})"\
-" ON CONFLICT (address, COALESCE(callback_url, '')) DO"\
-" UPDATE SET watching=true, label=${label_pg}, event_message=${event_pg}, expected_amount_sat=${expected_pg}"\
-" RETURNING id" \
-  "SELECT id FROM ark_watching WHERE address='${address}' AND callback_url${where_cb}")
+  id=$(sql_params "INSERT INTO ark_watching (address, watching, callback_url, label, event_message, expected_amount_sat)
+    VALUES (:'address', true, NULLIF(:'callback', ''), NULLIF(:'label', ''), NULLIF(:'event', ''), NULLIF(:'amount', '')::bigint)
+    ON CONFLICT (address, COALESCE(callback_url, '')) DO UPDATE SET
+    watching=true, label=EXCLUDED.label, event_message=EXCLUDED.event_message,
+    expected_amount_sat=EXCLUDED.expected_amount_sat RETURNING id;" \
+    -v "address=${address}" -v "callback=${callback_url}" -v "label=${label}" \
+    -v "event=${event_message}" -v "amount=${expected_amount}")
   returncode=$?
   trace_rc ${returncode}
 
@@ -78,7 +68,6 @@ ark_unwatchrequest() {
   local watchid=${1}
   local address=${2}
   local callback_url=${3}
-  local where_cb=
   local returncode
 
   if [ -n "${watchid}" ] && [ "${watchid}" != "null" ]; then
@@ -88,7 +77,7 @@ ark_unwatchrequest() {
         return 1
         ;;
     esac
-    sql "UPDATE ark_watching SET watching=false WHERE id=${watchid}"
+    sql_params "UPDATE ark_watching SET watching=false WHERE id=:'id'::integer;" -v "id=${watchid}" > /dev/null
     returncode=$?
     jq -cn --argjson id "${watchid}" '{event: "ark_unwatch", id: $id}'
     return ${returncode}
@@ -98,11 +87,10 @@ ark_unwatchrequest() {
     echo '{"error":{"code":-5,"message":"Invalid Ark address"}}'
     return 1
   fi
-  if [ -n "${callback_url}" ] && [ "${callback_url}" != "null" ]; then
-    where_cb=" AND callback_url='$(sql_quote "${callback_url}")'"
-  fi
-
-  sql "UPDATE ark_watching SET watching=false WHERE address='${address}'${where_cb}"
+  [ "${callback_url}" != "null" ] || callback_url=
+  sql_params "UPDATE ark_watching SET watching=false WHERE address=:'address'
+    AND (NULLIF(:'callback', '') IS NULL OR callback_url=:'callback');" \
+    -v "address=${address}" -v "callback=${callback_url}" > /dev/null
   returncode=$?
   jq -cn --arg a "${address}" --arg cb "${callback_url}" \
     '{event: "ark_unwatch", address: $a, callbackURL: (if $cb == "" or $cb == "null" then null else $cb end)}'

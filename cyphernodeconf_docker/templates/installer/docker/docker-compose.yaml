@@ -169,7 +169,20 @@ services:
       - "<%= ark_datapath %>:/barkd"
       - container_monitor:/container_monitor
     healthcheck:
-      test: sh -c 'curl -sf http://127.0.0.1:3000/ping > /dev/null && [ -f /barkd/token/auth_token ] && touch /container_monitor/barkd_ready || rm -f /container_monitor/barkd_ready'
+      test:
+        - CMD-SHELL
+        - |
+          if token=$$(cat "$${BARKD_TOKEN_DIR:-/barkd/token}/auth_token" 2>/dev/null) &&
+             [ -n "$$token" ] &&
+             wallet=$$(printf 'Authorization: Bearer %s\n' "$$token" |
+               curl --noproxy '*' --fail --silent --show-error --max-time 8 --header @- \
+                 "http://127.0.0.1:$${BARKD_BIND_PORT:-3000}/api/v1/wallet") &&
+             printf '%s\n' "$$wallet" | jq -e '.fingerprint | strings | length > 0' >/dev/null &&
+             touch /container_monitor/barkd_ready; then
+            exit 0
+          fi
+          rm -f /container_monitor/barkd_ready
+          exit 1
       interval: 30s
       timeout: 10s
       retries: 10

@@ -18,8 +18,8 @@ const bitcoinInternal = function(props) {
   return props.bitcoin_mode === 'internal'
 };
 
-const bitcoinInternalAndPrune = function(props) {
-  return bitcoinInternal(props) && props.bitcoin_prune;
+const canPruneBitcoin = function(props) {
+  return bitcoinInternal(props) && !props.features.includes('lightning') && !props.features.includes('ark');
 };
 
 module.exports = {
@@ -64,9 +64,7 @@ module.exports = {
       filter: utils.trimFilter,
     },
     {
-      when: function(props) {
-        return bitcoinInternal( props ) && props.features.indexOf('lightning') === -1;
-      },
+      when: canPruneBitcoin,
       type: 'confirm',
       name: 'bitcoin_prune',
       default: utils.getDefault( 'bitcoin_prune' ),
@@ -74,7 +72,7 @@ module.exports = {
     },
     {
       when: function(props) {
-        return bitcoinInternalAndPrune( props ) && props.features.indexOf('lightning') === -1;
+        return canPruneBitcoin(props) && props.bitcoin_prune;
       },
       type: 'input',
       name: 'bitcoin_prune_size',

@@ -10,7 +10,7 @@ set -u
 
 SQL_LOG=$(mktemp)
 NOTIFY_LOG=$(mktemp)
-trap 'rm -f "${SQL_LOG}" "${NOTIFY_LOG}" ./.arkmanagemissed.lock' EXIT
+ARK_LOCK_DIR=$(mktemp -d)
 
 TRACING=
 BARKD_URL=stub
@@ -20,6 +20,7 @@ TOR_ADDR_WATCH_WEBHOOKS=
 TOR_TXID_WATCH_WEBHOOKS=
 
 . ./ark_manage_missed.sh
+trap 'rm -f "${SQL_LOG}" "${NOTIFY_LOG}"; rm -rf "${ARK_LOCK_DIR}"' EXIT
 
 # --- stubs -------------------------------------------------------------------
 
@@ -28,17 +29,22 @@ TOR_TXID_WATCH_WEBHOOKS=
 sql() {
   printf '%s\n' "${1}" >> "${SQL_LOG}"
   case "${1}" in
-    "SELECT id FROM ark_watching WHERE watching AND address='ark1receiver'") printf '7' ;;
+    "UPDATE ark_job SET "*"movement_id=5"*) [ -z "${FAIL_WRITE:-}" ] || return 1 ;;
     "SELECT id, vtxos FROM ark_job WHERE status='pending' AND kind='board' AND movement_id IS NULL") printf '3|["v-board"]' ;;
     "SELECT row_to_json(t) FROM (SELECT r.id, w.callback_url"*)
       printf '{"id":11,"callback_url":"http://app/cb?a=1|2","label":"order|42","event_message":"ZXZlbnQ=","address":"ark1receiver","amount_sat":12345,"movement_id":9,"vtxos":"[\\"v-recv\\"]","expected_amount_sat":12345}' ;;
     "SELECT row_to_json(t) FROM (SELECT id, kind, label, callback_url"*)
       printf '{"id":3,"kind":"board","label":"topup-1","callback_url":"http://app/job","txid":"txid-b","movement_id":9,"vtxos":"[\\"v-board\\"]","status":"successful"}' ;;
-    "SELECT value FROM cyphernode_props WHERE property='ark_history_floor'") printf '%s' "${FLOOR:-4}" ;;
-    "SELECT value FROM cyphernode_props WHERE property='ark_history_seen'") printf '%s' "${SEEN:-}" ;;
-    "SELECT value FROM cyphernode_props WHERE property='ark_history_pending'") printf '%s' "${PENDING:-}" ;;
+    "SELECT value FROM cyphernode_props WHERE category='ark' AND property='ark_history_floor'") printf '%s' "${FLOOR:-4}" ;;
+    "SELECT value FROM cyphernode_props WHERE category='ark' AND property='ark_history_seen'") printf '%s' "${SEEN:-}" ;;
+    "SELECT value FROM cyphernode_props WHERE category='ark' AND property='ark_history_pending'") printf '%s' "${PENDING:-}" ;;
+    "SELECT COALESCE(json_agg(DISTINCT movement_id)"*) printf '%s' "${BOUND_JOBS:-[]}" ;;
     *) ;;
   esac
+}
+
+sql_params() {
+  printf '%s\n' "$@" >> "${SQL_LOG}"
 }
 
 notify_web() {
@@ -85,7 +91,7 @@ check "pending movements are ignored" "! grep -q 'INSERT INTO ark_receive' '${SQ
 
 ark_process_movement "${receive}"
 check "received movement is recorded once per watch" \
-  "grep -c \"INSERT INTO ark_receive (movement_id, ark_watching_id, address, amount_sat, vtxos) VALUES (9, 7, 'ark1receiver', 12345\" '${SQL_LOG}' | grep -q '^1$'"
+  "[ \"\$(grep -c 'INSERT INTO ark_receive' '${SQL_LOG}')\" -eq 1 ] && grep -q '^movement=9$' '${SQL_LOG}' && grep -q '^address=ark1receiver$' '${SQL_LOG}'"
 check "offboard jobs are matched by movement id" \
   "grep -q \"UPDATE ark_job SET status='successful', error=NULL, movement_id=9 WHERE status='pending' AND movement_id=9\" '${SQL_LOG}'"
 check "board jobs are matched by their vtxo ids" \
@@ -114,11 +120,11 @@ check "delivered callbacks are marked" \
 : > "${SQL_LOG}"
 ark_manage_missed
 check "catch-up stops below the oldest pending movement" \
-  "grep -q \"UPDATE cyphernode_props SET value='5' WHERE property='ark_history_floor'\" '${SQL_LOG}'"
+  "grep -q '^floor=5$' '${SQL_LOG}'"
 check "catch-up processes final movements above the floor" \
   "grep -q 'movement_id=8' '${SQL_LOG}'"
 check "catch-up remembers the highest movement seen and the pending ones" \
-  "grep -q \"SET value='8' WHERE property='ark_history_seen'\" '${SQL_LOG}' && grep -q \"SET value='\\[6\\]' WHERE property='ark_history_pending'\" '${SQL_LOG}'"
+  "grep -q '^seen=8$' '${SQL_LOG}' && grep -Fxq 'pending=[6]' '${SQL_LOG}' && [ \"\$(grep -c 'INSERT INTO cyphernode_props' '${SQL_LOG}')\" -eq 1 ]"
 
 # A second catch-up with nothing new must not replay movement 8 (final, already
 # seen) while movement 6 is still pending.
@@ -127,13 +133,24 @@ FLOOR=5 SEEN=8 PENDING='[6]' ark_manage_missed
 check "catch-up does not replay movements it already processed" \
   "! grep -q 'movement_id=8' '${SQL_LOG}'"
 
+: > "${SQL_LOG}"
+FLOOR=5 SEEN=8 PENDING='[6]' BOUND_JOBS='[4]' ark_manage_missed
+check "a pending job bound below the cursor is reconciled" "grep -q 'movement_id=4' '${SQL_LOG}'"
+
+: > "${SQL_LOG}"
+check "catch-up leaves the cursor unchanged after a failed movement write" \
+  "! FAIL_WRITE=1 ark_manage_missed && ! grep -q 'INSERT INTO cyphernode_props' '${SQL_LOG}'"
+
 # While another catch-up holds the lock, a new one returns without reading history.
 : > "${SQL_LOG}"
-( flock 7; sleep 2 ) 7>./.arkmanagemissed.lock &
+( flock 7; sleep 2 ) 7>"${ARK_LOCK_DIR}/ark-manage-missed.lock" &
 sleep 0.5
-ark_manage_missed
+check "a busy catch-up lock leaves the request retryable" "! ark_manage_missed"
 wait
 check "a catch-up already in progress makes a new one skip" \
   "! grep -q 'GET /history' '${SQL_LOG}'"
+
+check "runtime lock open failures propagate from both workers" \
+  "! ARK_LOCK_DIR='${ARK_LOCK_DIR}/missing' ark_manage_missed 2>/dev/null && ! ARK_LOCK_DIR='${ARK_LOCK_DIR}/missing' ark_do_callbacks 2>/dev/null"
 
 exit ${fail}

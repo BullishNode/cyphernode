@@ -10,11 +10,12 @@
 # picked up by ark_manage_missed from proxycron.
 
 ark_cursor_get() {
-  sql "SELECT value FROM cyphernode_props WHERE property='ark_last_pushed_at'"
+  sql "SELECT value FROM cyphernode_props WHERE category='ark' AND property='ark_last_pushed_at'"
 }
 
 ark_cursor_set() {
-  sql "UPDATE cyphernode_props SET value='$(sql_quote "${1}")' WHERE property='ark_last_pushed_at'" > /dev/null
+  sql_params "INSERT INTO cyphernode_props (category, property, value) VALUES ('ark', 'ark_last_pushed_at', :'cursor')
+    ON CONFLICT (category, property) DO UPDATE SET value=EXCLUDED.value;" -v "cursor=${1}" > /dev/null
 }
 
 ark_wait_notifications() {
@@ -33,7 +34,7 @@ ark_wait_notifications() {
     return 1
   fi
 
-  notifications=$(printf '%s' "${response}" | jq -c '.notifications[]?')
+  notifications=$(printf '%s' "${response}" | jq -c '.notifications[]') || return 1
   local IFS="
 "
   for notification in ${notifications}; do
@@ -41,20 +42,24 @@ ark_wait_notifications() {
     case "${kind}" in
       movement-created|movement-updated)
         movement=$(printf '%s' "${notification}" | jq -c '.movement')
-        ark_process_movement "${movement}"
+        ark_process_movement "${movement}" || return 1
         ;;
       channel-lagging)
         trace "[ark_wait_notifications] stream lagged, running catch-up"
-        ark_manage_missed
+        ark_manage_missed || return 1
         ;;
     esac
   done
   unset IFS
 
-  last_pushed_at=$(printf '%s' "${response}" | jq -r '.last_pushed_at // empty')
-  [ -n "${last_pushed_at}" ] && ark_cursor_set "${last_pushed_at}"
+  last_pushed_at=$(printf '%s' "${response}" | jq -r '.last_pushed_at // empty') || return 1
+  if [ -n "${last_pushed_at}" ]; then
+    ark_cursor_set "${last_pushed_at}" || return 1
+  fi
 
-  [ -n "${notifications}" ] && ark_do_callbacks
+  if [ -n "${notifications}" ]; then
+    ark_do_callbacks || return 1
+  fi
 
   return 0
 }
@@ -62,11 +67,16 @@ ark_wait_notifications() {
 . ./ark_manage_missed.sh
 
 # On start, catch up first so a long outage is covered before resuming the stream.
-ark_manage_missed
+while ! ark_manage_missed; do
+  sleep 10
+done
 
 while :
 do
-  since=$(ark_cursor_get)
+  if ! since=$(ark_cursor_get); then
+    sleep 10
+    continue
+  fi
   trace "[ark_notifications] since=${since}"
   if ark_wait_notifications "${since}"; then
     sleep 1

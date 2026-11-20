@@ -1931,7 +1931,7 @@ Proxy response:
 
 If the bolt11 includes a boltz route hint a liquid network address will be included in the response.  If the bolt11 does not include a boltz route hint, only the original invoice will be returned.
 
-If the bolt11 instead carries an Ark address in its route hints, the response has that address in `ark_address` (and `liquid_address` is null). The address is read from the invoice itself; Boltz is not involved. When the `ark` feature is installed, only an address of the Ark server the wallet is on is reported, and `ln_pay` pays such an invoice from the Ark wallet, on that address, instead of over Lightning: the reply is the one of `ark_lnpay`, without a `payment_preimage`.
+If the bolt11 carries an Ark address in its route hints, the response has that address in `ark_address` (and `liquid_address` is null). When the `ark` feature is installed, only an address of the Ark server the wallet is on is reported. Use `ark_lnpay` to pay from the Ark wallet. `ln_pay` uses Core Lightning and retains its Lightning response and status APIs.
 
 ```http
 POST http://cyphernode:8888/check_bolt11_mrh
@@ -2153,9 +2153,11 @@ Board and offboard callback body:
 GET http://cyphernode:8888/ark_getjob/topup-1
 ```
 
-A job refused by barkd is stored as `failed` with barkd's message in `error`
-and its label stays taken; the callback, when there is one, fires with that
-status and message. Retry under a new label.
+A confirmed refusal is stored as `failed` with barkd's message in `error`.
+A timeout or other uncertain result leaves the job `pending`. Look up its
+status with the original label. Repeating the same operation and label
+returns the recorded job without submitting it again. Use a new label only
+after reconciling the first operation and confirming another one is needed.
 
 ### Pay a Lightning invoice from the Ark wallet (called by your application)
 
@@ -2205,8 +2207,10 @@ know.
 
 With an `eventMessage`, once the payment is final the broker topic `ark_lnpay`
 carries `{"payment_hash":"...","movementId":14,"status":"complete","eventMessage":"eyJ..."}`,
-whether or not the call was still waiting. For a BOLT11 invoice decoded by the
-local Lightning node, the callback is recorded before submitting the payment.
+whether or not the call was still waiting. Cyphernode retries publication
+until the broker acknowledges it. Consumers should deduplicate deliveries
+using the payment hash, movement ID and status. For a BOLT11 invoice, the
+callback is recorded before submitting the payment.
 For an offer or Lightning address, barkd supplies the payment hash only after
 submission, so the callback cannot be recorded until then.
 

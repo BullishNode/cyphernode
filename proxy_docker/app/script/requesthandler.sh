@@ -1282,7 +1282,7 @@ main() {
           # BODY {"id":12}
 
           if [ "${http_method}" = "POST" ]; then
-            response=$(ark_unwatchrequest "$(echo "${line}" | jq -r ".id // empty")" "$(echo "${line}" | jq -r ".address // empty")" "$(echo "${line}" | jq -r ".callbackURL // empty")")
+            response=$(ark_unwatchrequest "$(echo "${line}" | jq -r ".id // empty")" "$(ark_request_address "${line}")" "$(echo "${line}" | jq -r ".callbackURL // empty")")
           else
             response=$(ark_unwatchrequest "" "$(echo "${line}" | cut -d ' ' -f2 | cut -d '/' -f3)" "")
           fi

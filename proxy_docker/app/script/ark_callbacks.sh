@@ -18,10 +18,10 @@ ark_process_movement() {
 
   local movement=${1}
   local status movement_id received jobs job_status job_error
-  local address amount watches watch_id vtxos
+  local address amount line vtxos
 
-  status=$(printf '%s' "${movement}" | jq -r '.status')
-  movement_id=$(printf '%s' "${movement}" | jq -r '.id')
+  status=$(printf '%s' "${movement}" | jq -er '.status | strings') || return 1
+  movement_id=$(printf '%s' "${movement}" | jq -er '.id | numbers | select(. >= 0 and floor == .)') || return 1
   trace "[ark_process_movement] movement ${movement_id} status ${status}"
 
   # Lightning movements carry their payment hash in the metadata; a failed
@@ -29,13 +29,15 @@ ark_process_movement() {
   case "$(printf '%s' "${movement}" | jq -r '.subsystem.name // empty')" in
     bark.lightning_send)
       case "${status}" in
-        successful) ark_ln_send_finish "$(printf '%s' "${movement}" | jq -r '.metadata.payment_hash // empty')" complete "${movement_id}" ;;
-        failed) ark_ln_send_finish "$(printf '%s' "${movement}" | jq -r '.metadata.payment_hash // empty')" failed "${movement_id}" ;;
+        successful) ark_ln_send_finish "$(printf '%s' "${movement}" | jq -r '.metadata.payment_hash // empty')" complete "${movement_id}" || return 1 ;;
+        failed) ark_ln_send_finish "$(printf '%s' "${movement}" | jq -r '.metadata.payment_hash // empty')" failed "${movement_id}" || return 1 ;;
       esac
       return 0
       ;;
     bark.lightning_receive)
-      [ "${status}" = "successful" ] && ark_ln_receive_movement "${movement}"
+      if [ "${status}" = "successful" ]; then
+        ark_ln_receive_movement "${movement}" || return 1
+      fi
       return 0
       ;;
     bark.arkoor)
@@ -44,10 +46,11 @@ ark_process_movement() {
       local invoice hash
       invoice=$(printf '%s' "${movement}" | jq -r '.sent_to[]? | select(.destination.type == "invoice") | .destination.value' | head -n 1)
       if [ -n "${invoice}" ]; then
-        hash=$(sql "SELECT payment_hash FROM ark_ln_send WHERE destination='$(sql_quote "${invoice}")' AND NOT published ORDER BY id DESC LIMIT 1")
+        hash=$(sql_params "SELECT payment_hash FROM ark_ln_send WHERE destination=:'invoice' AND status='pending' ORDER BY id DESC LIMIT 1;" \
+          -v "invoice=${invoice}") || return 1
         case "${status}" in
-          successful) ark_ln_send_finish "${hash}" complete "${movement_id}" ;;
-          failed) ark_ln_send_finish "${hash}" failed "${movement_id}" ;;
+          successful) ark_ln_send_finish "${hash}" complete "${movement_id}" || return 1 ;;
+          failed) ark_ln_send_finish "${hash}" failed "${movement_id}" || return 1 ;;
         esac
         return 0
       fi
@@ -60,38 +63,37 @@ ark_process_movement() {
     *) return 0 ;;
   esac
 
-  vtxos=$(printf '%s' "${movement}" | jq -c '.output_vtxos // []')
+  vtxos=$(printf '%s' "${movement}" | jq -c '.output_vtxos // []') || return 1
 
   if [ "${status}" = "successful" ]; then
     # Receives: one row per (movement, watch)
-    received=$(printf '%s' "${movement}" | jq -r '.received_on[]? | select(.destination.type == "ark") | "\(.destination.value)|\(.amount_sat)"')
+    received=$(printf '%s' "${movement}" | jq -c '.received_on[]? | select(.destination.type == "ark")') || return 1
     local IFS="
 "
     for line in ${received}; do
-      address=$(printf '%s' "${line}" | cut -d '|' -f1)
-      amount=$(printf '%s' "${line}" | cut -d '|' -f2)
-      watches=$(sql "SELECT id FROM ark_watching WHERE watching AND address='${address}'")
-      for watch_id in ${watches}; do
-        sql "INSERT INTO ark_receive (movement_id, ark_watching_id, address, amount_sat, vtxos)"\
-" VALUES (${movement_id}, ${watch_id}, '${address}', ${amount}, '$(sql_quote "${vtxos}")')"\
-" ON CONFLICT (movement_id, ark_watching_id) DO NOTHING" > /dev/null
-      done
+      address=$(printf '%s' "${line}" | jq -er '.destination.value | strings') || return 1
+      amount=$(printf '%s' "${line}" | jq -er '.amount_sat | numbers | select(. >= 0 and floor == .)') || return 1
+      sql_params "INSERT INTO ark_receive (movement_id, ark_watching_id, address, amount_sat, vtxos)
+        SELECT :'movement'::integer, id, :'address', :'amount'::bigint, :'vtxos'
+        FROM ark_watching WHERE watching AND address=:'address'
+        ON CONFLICT (movement_id, ark_watching_id) DO NOTHING;" \
+        -v "movement=${movement_id}" -v "address=${address}" -v "amount=${amount}" -v "vtxos=${vtxos}" > /dev/null || return 1
     done
     unset IFS
   fi
 
   # Jobs: offboards are matched by movement id, boards by their VTXO ids
-  sql "UPDATE ark_job SET status='${job_status}', error=${job_error}, movement_id=${movement_id} WHERE status='pending' AND movement_id=${movement_id}" > /dev/null
-  jobs=$(sql "SELECT id, vtxos FROM ark_job WHERE status='pending' AND kind='board' AND movement_id IS NULL")
+  sql "UPDATE ark_job SET status='${job_status}', error=${job_error}, movement_id=${movement_id} WHERE status='pending' AND movement_id=${movement_id}" > /dev/null || return 1
+  jobs=$(sql "SELECT id, vtxos FROM ark_job WHERE status='pending' AND kind='board' AND movement_id IS NULL") || return 1
   local IFS="
 "
   for line in ${jobs}; do
     local job_id job_vtxos overlap
     job_id=$(printf '%s' "${line}" | cut -d '|' -f1)
     job_vtxos=$(printf '%s' "${line}" | cut -d '|' -f2-)
-    overlap=$(jq -cn --argjson a "${job_vtxos:-[]}" --argjson b "${vtxos}" '($a - ($a - $b)) | length')
+    overlap=$(jq -cn --argjson a "${job_vtxos:-[]}" --argjson b "${vtxos}" '($a - ($a - $b)) | length') || return 1
     if [ "${overlap}" -gt 0 ]; then
-      sql "UPDATE ark_job SET status='${job_status}', error=${job_error}, movement_id=${movement_id} WHERE id=${job_id} AND status='pending'" > /dev/null
+      sql "UPDATE ark_job SET status='${job_status}', error=${job_error}, movement_id=${movement_id} WHERE id=${job_id} AND status='pending'" > /dev/null || return 1
     fi
   done
   unset IFS
@@ -122,7 +124,7 @@ ark_ln_receive_movement() {
 ark_do_callbacks() {
   trace "Entering ark_do_callbacks()..."
   (
-  local rows row
+  local rows row failed=0
   local IFS="
 "
 
@@ -133,30 +135,30 @@ ark_do_callbacks() {
 
   rows=$(sql_json "SELECT r.id, w.callback_url, w.label, w.event_message, r.address, r.amount_sat, r.movement_id, r.vtxos, w.expected_amount_sat"\
 " FROM ark_receive r JOIN ark_watching w ON w.id = r.ark_watching_id"\
-" WHERE NOT r.calledback AND w.callback_url IS NOT NULL AND w.callback_url <> ''")
+" WHERE NOT r.calledback AND w.callback_url IS NOT NULL AND w.callback_url <> ''") || exit 1
   for row in ${rows}; do
-    ark_receive_callback "${row}"
+    ark_receive_callback "${row}" || failed=1
   done
 
   rows=$(sql_json "SELECT id, kind, label, callback_url, txid, movement_id, vtxos, status, error FROM ark_job"\
-" WHERE NOT calledback AND status <> 'pending' AND callback_url IS NOT NULL AND callback_url <> ''")
+" WHERE NOT calledback AND status <> 'pending' AND callback_url IS NOT NULL AND callback_url <> ''") || exit 1
   for row in ${rows}; do
-    ark_job_callback "${row}"
+    ark_job_callback "${row}" || failed=1
   done
 
   rows=$(sql_json "SELECT id, label, bolt11, payment_hash, callback_url, event_message, amount_sat, received_sat, fee_sat, movement_id FROM ark_ln_invoice"\
-" WHERE NOT calledback AND status = 'paid' AND callback_url IS NOT NULL AND callback_url <> ''")
+" WHERE NOT calledback AND status = 'paid' AND callback_url IS NOT NULL AND callback_url <> ''") || exit 1
   for row in ${rows}; do
-    ark_ln_invoice_callback "${row}"
+    ark_ln_invoice_callback "${row}" || failed=1
   done
 
   # Receives, jobs and invoices without a callback URL are marked delivered immediately.
-  sql "UPDATE ark_receive r SET calledback=true FROM ark_watching w WHERE w.id = r.ark_watching_id AND NOT r.calledback AND (w.callback_url IS NULL OR w.callback_url = '')" > /dev/null
-  sql "UPDATE ark_job SET calledback=true WHERE NOT calledback AND status <> 'pending' AND (callback_url IS NULL OR callback_url = '')" > /dev/null
-  sql "UPDATE ark_ln_invoice SET calledback=true WHERE NOT calledback AND status = 'paid' AND (callback_url IS NULL OR callback_url = '')" > /dev/null
-  ) 8>./.ark_callbacks.lock
-
-  return 0
+  sql "UPDATE ark_receive r SET calledback=true FROM ark_watching w WHERE w.id = r.ark_watching_id AND NOT r.calledback AND (w.callback_url IS NULL OR w.callback_url = '')" > /dev/null || failed=1
+  sql "UPDATE ark_job SET calledback=true WHERE NOT calledback AND status <> 'pending' AND (callback_url IS NULL OR callback_url = '')" > /dev/null || failed=1
+  sql "UPDATE ark_ln_invoice SET calledback=true WHERE NOT calledback AND status = 'paid' AND (callback_url IS NULL OR callback_url = '')" > /dev/null || failed=1
+  ark_ln_publish_pending || failed=1
+  exit "${failed}"
+  ) 8>"${ARK_LOCK_DIR:-${DB_PATH:-/tmp}}/ark-callbacks.lock"
 }
 
 # ark_receive_callback <json row>
@@ -178,10 +180,10 @@ ark_receive_callback() {
   returncode=$?
   trace_rc ${returncode}
   if [ "${returncode}" -eq 0 ]; then
-    sql "UPDATE ark_receive SET calledback=true, calledback_ts=CURRENT_TIMESTAMP WHERE id=${id}" > /dev/null
+    sql "UPDATE ark_receive SET calledback=true, calledback_ts=CURRENT_TIMESTAMP WHERE id=${id}" > /dev/null || return 1
   else
     trace "[ark_receive_callback] callback failed: ${url}"
-    sql "UPDATE ark_receive SET callback_failures=callback_failures+1 WHERE id=${id}" > /dev/null
+    sql "UPDATE ark_receive SET callback_failures=callback_failures+1 WHERE id=${id}" > /dev/null || return 1
   fi
   return ${returncode}
 }
@@ -204,10 +206,10 @@ ark_job_callback() {
   returncode=$?
   trace_rc ${returncode}
   if [ "${returncode}" -eq 0 ]; then
-    sql "UPDATE ark_job SET calledback=true, calledback_ts=CURRENT_TIMESTAMP WHERE id=${id}" > /dev/null
+    sql "UPDATE ark_job SET calledback=true, calledback_ts=CURRENT_TIMESTAMP WHERE id=${id}" > /dev/null || return 1
   else
     trace "[ark_job_callback] callback failed: ${url}"
-    sql "UPDATE ark_job SET callback_failures=callback_failures+1 WHERE id=${id}" > /dev/null
+    sql "UPDATE ark_job SET callback_failures=callback_failures+1 WHERE id=${id}" > /dev/null || return 1
   fi
   return ${returncode}
 }
@@ -232,10 +234,10 @@ ark_ln_invoice_callback() {
   returncode=$?
   trace_rc ${returncode}
   if [ "${returncode}" -eq 0 ]; then
-    sql "UPDATE ark_ln_invoice SET calledback=true, calledback_ts=CURRENT_TIMESTAMP WHERE id=${id}" > /dev/null
+    sql "UPDATE ark_ln_invoice SET calledback=true, calledback_ts=CURRENT_TIMESTAMP WHERE id=${id}" > /dev/null || return 1
   else
     trace "[ark_ln_invoice_callback] callback failed: ${url}"
-    sql "UPDATE ark_ln_invoice SET callback_failures=callback_failures+1 WHERE id=${id}" > /dev/null
+    sql "UPDATE ark_ln_invoice SET callback_failures=callback_failures+1 WHERE id=${id}" > /dev/null || return 1
   fi
   return ${returncode}
 }
