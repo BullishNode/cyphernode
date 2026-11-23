@@ -495,25 +495,22 @@ ark_bolt11_amount_msat() {
   esac
 }
 
-# The newest send movement for the payment hash, or for the invoice when no
-# hash is known. Only movements above the optional attempt floor are observed.
-# An invoice paid on the Ark address in its route hints is not
-# a Lightning send: barkd records it as a bark.arkoor send to the invoice.
+# The newest Lightning send for the hash after the optional attempt floor.
 ark_ln_find_send_movement() {
   local path=/history
   local history
   [ -n "${2:-}" ] && path="/history?type=invoice&value=${2}"
   history=$(ark_barkd_read "${path}") || return 1
-  printf '%s' "${history}" | jq -c --arg h "${1}" --arg i "${2:-}" --argjson floor "${3:--1}" '
-    if type == "array" then
-      [ .[] | select(.id > $floor) | select(
-          (.subsystem.name == "bark.lightning_send" and
-            (if $h != "" then .metadata.payment_hash == $h
-             else $i != "" and any(.sent_to[]?; .destination.value == $i) end))
-          or ($i != "" and .subsystem.name == "bark.arkoor" and .subsystem.kind == "send"
-              and any(.sent_to[]?; .destination.value == $i))) ]
-      | max_by(.id) // empty
-    else error("invalid wallet history") end'
+  printf '%s' "${history}" | jq -c --arg h "${1}" --arg i "${2:-}" --argjson floor "${3:-null}" '
+    if type != "array" then error("invalid wallet history") else . end
+    | (map(select(.id > ($floor // -1) and .subsystem.name == "bark.lightning_send"
+        and .metadata.payment_hash == $h))
+       | max_by([($floor == null and .status == "successful"), .id])) as $native
+    | if $floor == null and $native.status != "successful" and $native.status != "pending" and any(.[];
+      .subsystem.name != "bark.lightning_send" and (.status == "successful" or .status == "pending")
+      and any(.sent_to[]?; .destination.type == "invoice" and .destination.value == $i))
+    then error("prior payment to this invoice requires reconciliation")
+    else $native // empty end'
 }
 
 # ark_ln_send_reply <status> <payment hash> <destination> <amount msat> [movement json] [already paid]
@@ -581,33 +578,6 @@ ark_ln_send_begin() {
 # lightning feature, Cyphernode's own CLN also decodes the invoice for the
 # description check and the payment hash; without it, the description is
 # not checked and the payment hash comes from barkd's reply.
-# The public key of the Ark server the wallet is on; empty when unknown.
-# Cache across script processes, with an explicit refresh after a failed hint
-# check. The cache contains only a public key.
-ark_server_pubkey() {
-  local cache
-  if [ -n "${ARK_SERVER_PUBKEY_CACHE:-}" ]; then
-    cache=${ARK_SERVER_PUBKEY_CACHE}
-  else
-    [ -n "${DB_PATH:-}" ] || return 1
-    cache=${DB_PATH}/ark_server_pubkey
-  fi
-  local info key tmp
-  [ ! -L "${cache}" ] || return 1
-  if [ "${1:-}" != refresh ] && [ -s "${cache}" ]; then
-    cat "${cache}"
-    return 0
-  fi
-  info=$(BARKD_TIMEOUT=20 ark_barkd_read /wallet/ark-info) || return 1
-  key=$(printf '%s' "${info}" | jq -r '.server_pubkey // empty' 2>/dev/null)
-  [ -n "${key}" ] || return 1
-  umask 077
-  tmp=$(mktemp "${cache}.XXXXXX") || return 1
-  printf '%s' "${key}" > "${tmp}"
-  mv "${tmp}" "${cache}"
-  printf '%s' "${key}"
-}
-
 ark_lnpay() (
   trace "Entering ark_lnpay()..."
 
@@ -700,7 +670,13 @@ ark_lnpay() (
       return 1
     fi
     movement=$(ark_ln_find_send_movement "${payment_hash}" "${bolt11}") || {
-      echo '{"error":{"code":-32001,"message":"Ark payment history unavailable; nothing was sent"}}'
+      prior_status=$(sql "SELECT status FROM ark_ln_send WHERE payment_hash='${payment_hash}'") || return 1
+      case "${prior_status}" in
+        complete|pending)
+          ark_ln_send_reply "${prior_status}" "${payment_hash}" "${destination}" "${invoice_msat:-${expected_msatoshi}}" '' true
+          return 0 ;;
+      esac
+      echo '{"error":{"code":-32001,"message":"Ark payment history could not be verified; nothing was sent"}}'
       return 1
     }
     case "$(printf '%s' "${movement}" | jq -r '.status // empty')" in
@@ -804,11 +780,6 @@ ark_lnpay() (
       status=failed
       break
     fi
-    # Paid on the invoice's Ark address: final as soon as barkd recorded it.
-    if [ "$(printf '%s' "${movement}" | jq -r 'select(.subsystem.name == "bark.arkoor") | .status')" = "successful" ]; then
-      status=complete
-      break
-    fi
     [ "$(date +%s)" -ge "${deadline}" ] && break
     sleep "${ARK_LNPAY_POLL:-2}"
   done
@@ -827,8 +798,7 @@ ark_lnpay() (
 #
 # Like ln_create_invoice, paid into the Ark wallet. The label is recorded
 # before barkd is called so a repeated label cannot create two invoices. The
-# amount received is the invoice amount minus the server's lightning_receive
-# fee (see ark_getinfo); the callback reports both.
+# callback reports the invoice amount and the amount credited after the receive fee.
 ark_lncreateinvoice() {
   trace "Entering ark_lncreateinvoice()..."
 

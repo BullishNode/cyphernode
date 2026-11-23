@@ -40,21 +40,6 @@ ark_process_movement() {
       fi
       return 0
       ;;
-    bark.arkoor)
-      # An invoice settled on its Ark address has no Lightning payment hash
-      # in the movement. Resolve the pre-submission row by invoice instead.
-      local invoice hash
-      invoice=$(printf '%s' "${movement}" | jq -r '.sent_to[]? | select(.destination.type == "invoice") | .destination.value' | head -n 1)
-      if [ -n "${invoice}" ]; then
-        hash=$(sql_params "SELECT payment_hash FROM ark_ln_send WHERE destination=:'invoice' AND status='pending' ORDER BY id DESC LIMIT 1;" \
-          -v "invoice=${invoice}") || return 1
-        case "${status}" in
-          successful) ark_ln_send_finish "${hash}" complete "${movement_id}" || return 1 ;;
-          failed) ark_ln_send_finish "${hash}" failed "${movement_id}" || return 1 ;;
-        esac
-        return 0
-      fi
-      ;;
   esac
 
   case "${status}" in

@@ -1931,7 +1931,7 @@ Proxy response:
 
 If the bolt11 includes a boltz route hint a liquid network address will be included in the response.  If the bolt11 does not include a boltz route hint, only the original invoice will be returned.
 
-If the bolt11 carries an Ark address in its route hints, the response has that address in `ark_address` (and `liquid_address` is null). When the `ark` feature is installed, only an address of the Ark server the wallet is on is reported. Use `ark_lnpay` to pay from the Ark wallet. `ln_pay` uses Core Lightning and retains its Lightning response and status APIs.
+Use `ark_lnpay` to pay an invoice from the Ark wallet. `ln_pay` pays from Core Lightning.
 
 ```http
 POST http://cyphernode:8888/check_bolt11_mrh
@@ -2197,13 +2197,13 @@ Proxy response:
 `status` is `complete`, `failed`, or `pending` when the outcome is still
 unknown after 85 seconds; follow a pending payment through `ark_getmovement`
 on `movementId` or through the broker message. `amount_sent_msat` includes
-the server's `lightning_send` fee, shown in `ark_getinfo` under
-`ark_info.fees`. An invoice already paid or being paid is reported with
-`already_paid: true` instead of being paid again. A refusal comes back as
-`{"error":{"code":...,"message":...}}` and nothing was sent. Code -32001
-means barkd could not be reached after the request: the outcome is unknown,
-check `ark_listmovements`. Do not retry a payment whose outcome you do not
-know.
+the server's send fee, shown under `ark_info.fees.lightning_send` in
+`ark_getinfo`. Same-server invoices use `ark_info.fees.intra_ark.lightning_send`
+when configured. A recorded or in-flight payment returns `already_paid: true`.
+An error with code -32001 means the payment history could not be verified
+before submission, or the outcome is unknown after submission. The message
+identifies the case. Check `ark_listmovements` and the existing payment
+record before retrying.
 
 With an `eventMessage`, once the payment is final the broker topic `ark_lnpay`
 carries `{"payment_hash":"...","movementId":14,"status":"complete","eventMessage":"eyJ..."}`,
@@ -2220,8 +2220,9 @@ Like `ln_create_invoice`, with the Ark server's node as payee. `msatoshi` is
 required and must be a whole number of satoshis; `label` must be unique;
 `expiry` is in seconds, optional, and capped by the Ark server's invoice
 expiry. The invoice is issued for the amount requested; what the wallet
-receives is that amount minus the server's `lightning_receive` fee, shown in
-`ark_getinfo` under `ark_info.fees`, and the callback reports both.
+receives is that amount minus the receive fee. Same-server payments use
+`ark_info.fees.intra_ark.lightning_receive` when configured and otherwise use
+`ark_info.fees.lightning_receive`. The callback reports the actual amounts.
 
 ```http
 POST http://cyphernode:8888/ark_lncreateinvoice

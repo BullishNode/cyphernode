@@ -43,3 +43,9 @@ recovers what the server still owes it:
    movement id for the same watched address is not called back again.
 
 Do both on a quiet wallet: no sends, boards or offboards in flight.
+
+Before upgrading an existing wallet, finish any pending invoice payments
+made by direct Ark transfer and reconcile their callbacks with the previous
+adapter. Keep the payment journal when switching versions. A historical
+outgoing transfer to the invoice without a Lightning receipt requires
+reconciliation before the adapter will submit that invoice again.
