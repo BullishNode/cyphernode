@@ -23,7 +23,6 @@ TRACING=
 BARKD_URL=stub
 BARKD_CURL_CFG=/dev/null
 BARKD_TOKEN_FILE=/dev/null
-ARK_SERVER_PUBKEY_CACHE="${STATE}/server_pubkey"
 ARK_LOCK_DIR=${STATE}
 TOR_ADDR_WATCH_WEBHOOKS=
 TOR_TXID_WATCH_WEBHOOKS=
@@ -149,7 +148,7 @@ sql() {
         printf pending > "${STATE}/send_status"
         printf '1'
       fi ;;
-    "SELECT status FROM ark_ln_send "*) cat "${STATE}/send_status" ;;
+    "SELECT status FROM ark_ln_send "*) if [ -f "${STATE}/send_status" ]; then cat "${STATE}/send_status"; fi ;;
     "UPDATE ark_ln_send SET status="*)
       if [ ! -f "${STATE}/send_status" ] || [ "$(cat "${STATE}/send_status")" = pending ]; then
         printf '%s' "${1}" | sed -n "s/.*SET status='\([^']*\)'.*/\1/p" > "${STATE}/send_status"
@@ -173,7 +172,6 @@ sql() {
 
 sql_params() {
   printf '%s\n' "$@" >> "${SQL_LOG}"
-  case "${1}" in "SELECT payment_hash FROM ark_ln_send WHERE destination="*) printf '%s' "${HASH}" ;; esac
 }
 
 mosquitto_pub() {
@@ -211,13 +209,9 @@ check "m, n and p multipliers and whole bitcoins" \
 check "offers, lightning addresses and lnurls are not invoices" \
   "! ark_is_bolt11 lno1qqqq && ! ark_is_bolt11 user@domain.com && ! ark_is_bolt11 lnurl1qqqq && ark_is_bolt11 ${INV}"
 
-( barkd_call() { [ "${BARKD_TIMEOUT:-}" = 20 ] && echo '{"server_pubkey":"02aa"}'; }
-  check "Ark server lookup allows a busy wallet twenty seconds" "[ \"\$(ark_server_pubkey)\" = 02aa ]"
-) || fail=1
-
 ( . ./paymentalist.sh
   send_to_paymentalist() { printf '%s' "${2}"; }
-  payload=$(check_bolt11_mrh 'lnbc1"escaped' '' '02aa')
+  payload=$(check_bolt11_mrh 'lnbc1"escaped' '')
   check "paymentalist request safely JSON-escapes the invoice" \
     "[ \"\$(printf '%s' '${payload}' | jq -r '.invoice')\" = 'lnbc1\"escaped' ]"
 ) || fail=1
@@ -471,10 +465,7 @@ check "catch-up processes the send movement" \
   "grep -q \"UPDATE ark_ln_send SET status='complete', movement_id=14\" '${SQL_LOG}'"
 PREPAID=
 
-# --- an invoice paid on its Ark address ---------------------------------------
-
-# barkd pays it with an arkoor: no Lightning send exists, and the movement is
-# a bark.arkoor send to the invoice.
+# A historical outgoing movement can name the invoice without proving a Lightning send.
 arkoor_movement='{"id":21,"status":"successful","subsystem":{"name":"bark.arkoor","kind":"send"},"metadata":{},"offchain_fee_sat":0,"sent_to":[{"destination":{"type":"invoice","value":"'${INV}'"},"amount_sat":1000}]}'
 (
   barkd_call() {
@@ -490,49 +481,47 @@ arkoor_movement='{"id":21,"status":"successful","subsystem":{"name":"bark.arkoor
   }
   reset
   out=$(ark_lnpay "{\"bolt11\":\"${INV}\",\"expected_msatoshi\":1000000}")
-  check "an invoice paid on its Ark address is complete, without a preimage" \
-    "jqcheck '${out}' '.status == \"complete\" and .movementId == 21 and .payment_preimage == null and .amount_msat == 1000000 and .amount_sent_msat == 1000000'"
-  check "its send row is marked complete" "grep -q \"UPDATE ark_ln_send SET status='complete', movement_id=21\" '${SQL_LOG}'"
-  reset
-  SEND_EVENT=ZXZlbnQ=
+  check "a transfer without a Lightning receipt leaves the payment pending" \
+    "jqcheck '${out}' '.status == \"pending\" and .movementId == null' && ! grep -q \"SET status='complete'\" '${SQL_LOG}'"
   ark_process_movement "${arkoor_movement}"
-  ark_do_callbacks
-  check "movement loop closes and publishes an Ark-address invoice payment" \
-    "grep -q \"invoice=${INV}\" '${SQL_LOG}' && grep -q \"UPDATE ark_ln_send SET status='complete', movement_id=21\" '${SQL_LOG}' && [ \"\$(grep -c '^ark_lnpay ' '${MQTT_LOG}')\" -eq 1 ]"
+  check "a generic transfer callback cannot settle a Lightning payment" \
+    "! grep -q \"SET status='complete'\" '${SQL_LOG}'"
   reset
   PREPAID=1
-  out=$(ark_lnpay "{\"bolt11\":\"${INV}\",\"expected_msatoshi\":1000000}")
-  check "paying it again reports it already paid and pays nothing" \
-    "jqcheck '${out}' '.status == \"complete\" and .already_paid == true' && ! grep -q '^POST /lightning/pay' '${BARKD_LOG}'"
+  out=$(ark_lnpay "{\"bolt11\":\"${INV}\"}" 2>/dev/null)
+  check "unknown wallet history prevents resubmitting the invoice" \
+    "jqcheck '${out}' '.error.code == -32001' && ! grep -q '^POST /lightning/pay' '${BARKD_LOG}'"
+  for state in complete pending; do
+    printf '%s' "${state}" > "${STATE}/send_status"
+    out=$(ark_lnpay "{\"bolt11\":\"${INV}\"}" 2>/dev/null)
+    check "a recorded ${state} payment is returned without resubmission" \
+      "jqcheck '${out}' '.status == \"${state}\" and .already_paid and .payment_preimage == null' && ! grep -q '^POST /lightning/pay' '${BARKD_LOG}'"
+  done
+  native=$(send_movement successful)
+  arkoor_movement="${arkoor_movement},${native}"
+  out=$(ark_lnpay "{\"bolt11\":\"${INV}\"}")
+  check "a native receipt preserves proof and fees when history also has another transfer" \
+    "jqcheck '${out}' '.status == \"complete\" and .payment_preimage == \"${PRE}\" and .amount_sent_msat == 1077000' && ! grep -q '^POST /lightning/pay' '${BARKD_LOG}'"
   exit ${fail}
 ) || fail=1
 PREPAID=
 
-# --- invoices with an Ark address route hint -----------------------------------
+# --- ordinary Core Lightning payments ----------------------------------------
 
 # ln_pay itself, with the stubs put back over what its file defines.
 . ./call_lightningd.sh
 ln_call_lightningd() {
   printf '%s\n' "$*" >> "${CLN_LOG}"
-  local routes='[]'
-  [ "${HINT_MODE:-none}" = ark ] && routes='[[{"short_channel_id":"6386283x65536x0"}]]'
-  echo "{\"type\":\"bolt11 invoice\",\"valid\":true,\"payment_hash\":\"${HASH}\",\"amount_msat\":${CLN_AMOUNT},\"description\":\"shape\",\"routes\":${routes}}"
+  echo "{\"type\":\"bolt11 invoice\",\"valid\":true,\"payment_hash\":\"${HASH}\",\"amount_msat\":${CLN_AMOUNT},\"description\":\"shape\",\"routes\":[]}"
 }
 ln_listpays() {
   echo '{"pays":[{"status":"complete","payment_hash":"cln"}]}'
 }
 
-# A route hint does not change the Core Lightning contract of ln_pay.
 ark_lnpay() { touch "${STATE}/ark_lnpay"; return 1; }
 
 reset
-FEATURE_ARK=true HINT_MODE=ark
-out=$(ln_pay "{\"bolt11\":\"${INV}\",\"destination\":\"ignored\",\"expected_msatoshi\":1000000}")
-check "ln_pay with an Ark hint keeps the Core Lightning result" \
-  "jqcheck '${out}' '.payment_hash == \"cln\"' && [ ! -f '${STATE}/ark_lnpay' ] && grep -q '^decode ${INV}' '${CLN_LOG}'"
-
-reset
-HINT_MODE=none
+FEATURE_ARK=true
 out=$(ln_pay "{\"bolt11\":\"${INV}\",\"expected_msatoshi\":1000000}")
 check "ordinary ln_pay retains the Core Lightning result" \
   "jqcheck '${out}' '.payment_hash == \"cln\"' && [ ! -f '${STATE}/ark_lnpay' ]"
